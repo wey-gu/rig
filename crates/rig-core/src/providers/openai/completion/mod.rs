@@ -41,6 +41,26 @@ where
     content.serialize(serializer)
 }
 
+/// Chat Completions-compatible backends are much stricter about system
+/// messages than OpenAI itself. A single/multiple text-only system preamble is
+/// accepted most widely as one plain string; content-part arrays are rejected by
+/// providers such as llama.cpp-derived gateways and CodeBuddy-compatible
+/// routers. Responses API-specific part types must never leak here.
+fn serialize_system_content<S>(
+    content: &OneOrMany<SystemContent>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let text = content
+        .iter()
+        .map(|part| part.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    serializer.serialize_str(&text)
+}
+
 /// `gpt-5.5` completion model
 pub const GPT_5_5: &str = "gpt-5.5";
 
@@ -137,7 +157,10 @@ impl From<ApiErrorResponse> for CompletionError {
 pub enum Message {
     #[serde(alias = "developer")]
     System {
-        #[serde(deserialize_with = "string_or_one_or_many")]
+        #[serde(
+            deserialize_with = "string_or_one_or_many",
+            serialize_with = "serialize_system_content"
+        )]
         content: OneOrMany<SystemContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
@@ -1568,6 +1591,42 @@ mod tests {
             serde_json::to_value(openai_request).expect("serialization should succeed");
 
         assert_eq!(serialized["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn system_preamble_serializes_as_plain_chat_completions_string() {
+        let request = crate::completion::CompletionRequest {
+            model: None,
+            preamble: Some("Native system prompt\n\nPersona instruction".to_string()),
+            chat_history: crate::OneOrMany::one("Hello".into()),
+            documents: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+
+        let openai_request = CompletionRequest::try_from(OpenAIRequestParams {
+            model: "gpt-4o-mini".to_string(),
+            request,
+            strict_tools: false,
+            tool_result_array_content: false,
+        })
+        .expect("request conversion should succeed");
+        let serialized =
+            serde_json::to_value(openai_request).expect("serialization should succeed");
+
+        assert_eq!(serialized["messages"][0]["role"], "system");
+        assert_eq!(
+            serialized["messages"][0]["content"],
+            "Native system prompt\n\nPersona instruction"
+        );
+        assert!(
+            !serialized.to_string().contains("input_text"),
+            "Responses API content types must not leak into Chat Completions"
+        );
     }
 
     #[test]
