@@ -1000,7 +1000,11 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     .as_ref()
                     .map(|d| d.cached_tokens as u64)
                     .unwrap_or(0),
-                cache_creation_input_tokens: 0,
+                cache_creation_input_tokens: usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|details| details.cache_write_tokens as u64)
+                    .unwrap_or(0),
                 tool_use_prompt_tokens: 0,
                 reasoning_tokens: 0,
             })
@@ -1093,6 +1097,10 @@ pub struct PromptTokensDetails {
     /// Cached tokens from prompt caching
     #[serde(default)]
     pub cached_tokens: usize,
+    /// Tokens written to the prompt cache. Reported by GPT-5.6 and newer
+    /// model families, where cache writes have distinct billing.
+    #[serde(default)]
+    pub cache_write_tokens: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1135,7 +1143,7 @@ impl fmt::Display for Usage {
 
 impl GetTokenUsage for Usage {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
-        Some(crate::providers::internal::completion_usage(
+        let mut usage = crate::providers::internal::completion_usage(
             self.prompt_tokens as u64,
             (self.total_tokens - self.prompt_tokens) as u64,
             self.total_tokens as u64,
@@ -1143,7 +1151,13 @@ impl GetTokenUsage for Usage {
                 .as_ref()
                 .map(|d| d.cached_tokens as u64)
                 .unwrap_or(0),
-        ))
+        );
+        usage.cache_creation_input_tokens = self
+            .prompt_tokens_details
+            .as_ref()
+            .map(|details| details.cache_write_tokens as u64)
+            .unwrap_or(0);
+        Some(usage)
     }
 }
 
@@ -2125,6 +2139,23 @@ mod tests {
             reasoning.first_text(),
             Some("Now I understand the structure better. I need to: ...")
         );
+    }
+
+    #[test]
+    fn openai_usage_normalizes_prompt_cache_reads_and_writes() {
+        let usage = Usage {
+            prompt_tokens: 2_006,
+            total_tokens: 2_306,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: 1_920,
+                cache_write_tokens: 64,
+            }),
+        };
+        let normalized = usage.token_usage().expect("normalized usage");
+        assert_eq!(normalized.input_tokens, 2_006);
+        assert_eq!(normalized.output_tokens, 300);
+        assert_eq!(normalized.cached_input_tokens, 1_920);
+        assert_eq!(normalized.cache_creation_input_tokens, 64);
     }
 
     #[test]

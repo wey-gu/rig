@@ -566,11 +566,11 @@ mod tests {
         use crate::test_utils::MockStreamingClient;
         use futures::StreamExt;
 
-        // Usage chunk includes prompt_tokens_details with cached_tokens.
+        // Usage chunk includes both prompt-cache reads and writes.
         let client = MockStreamingClient {
             sse_bytes: sse_bytes_from_data_lines([
                 "{\"choices\":[{\"delta\":{\"content\":\"Hi\",\"tool_calls\":[]}}],\"usage\":null}",
-                "{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110,\"prompt_tokens_details\":{\"cached_tokens\":80}}}",
+                "{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110,\"prompt_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":16}}}",
                 "[DONE]",
             ]),
         };
@@ -608,6 +608,7 @@ mod tests {
         // Verify core Usage also has cached_input_tokens via GetTokenUsage
         let core_usage = res.token_usage().expect("token_usage should return Some");
         assert_eq!(core_usage.cached_input_tokens, 80);
+        assert_eq!(core_usage.cache_creation_input_tokens, 16);
         assert_eq!(core_usage.input_tokens, 100);
         assert_eq!(core_usage.total_tokens, 110);
     }
