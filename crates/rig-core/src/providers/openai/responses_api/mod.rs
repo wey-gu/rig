@@ -885,6 +885,7 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
         };
 
         let mut additional_tools = Vec::new();
+        let mut max_output_tokens_override: Option<Option<u64>> = None;
         if let Some(additional_params_map) = additional_params_payload.as_object_mut() {
             if let Some(raw_tools) = additional_params_map.remove("tools") {
                 additional_tools = serde_json::from_value::<Vec<ResponsesToolDefinition>>(
@@ -900,6 +901,22 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
                 })?;
             }
             additional_params_map.remove("stream");
+            if let Some(raw_max_output_tokens) = additional_params_map.remove("max_output_tokens") {
+                max_output_tokens_override = Some(if raw_max_output_tokens.is_null() {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_value::<u64>(raw_max_output_tokens).map_err(|err| {
+                            CompletionError::RequestError(
+                                format!(
+                                    "Invalid OpenAI Responses max_output_tokens override: {err}"
+                                )
+                                .into(),
+                            )
+                        })?,
+                    )
+                });
+            }
         }
 
         if additional_params_payload.is_boolean() {
@@ -960,7 +977,7 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
             input,
             model,
             instructions: None, // is currently None due to lack of support in compliant providers
-            max_output_tokens: req.max_tokens,
+            max_output_tokens: max_output_tokens_override.unwrap_or(req.max_tokens),
             stream,
             tool_choice,
             tools,
@@ -2585,6 +2602,30 @@ mod tests {
         assert_eq!(assistant_items.len(), 1);
         assert_eq!(assistant_items[0]["content"][0]["type"], "input_text");
         assert_eq!(assistant_items[0]["content"][0]["text"], "final answer");
+    }
+
+    #[test]
+    fn additional_params_can_omit_max_output_tokens_for_compatible_gateways() {
+        let request = crate::completion::CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::one(completion::Message::User {
+                content: OneOrMany::one(message::UserContent::Text(Text::new("Reply OK"))),
+            }),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(64),
+            tool_choice: None,
+            additional_params: Some(json!({ "max_output_tokens": null })),
+            output_schema: None,
+        };
+
+        let request = CompletionRequest::try_from(("gpt-compatible".to_string(), request))
+            .expect("request should convert");
+        assert_eq!(request.max_output_tokens, None);
+        let value = serde_json::to_value(request).expect("request should serialize");
+        assert!(value.get("max_output_tokens").is_none());
     }
 
     #[test]
