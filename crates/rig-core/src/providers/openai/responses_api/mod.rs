@@ -848,6 +848,13 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
         (model, mut req): (String, crate::completion::CompletionRequest),
     ) -> Result<Self, Self::Error> {
         let model = req.model.clone().unwrap_or(model);
+        let use_instructions = req
+            .additional_params
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|params| params.get("_rig_preamble_transport"))
+            .and_then(Value::as_str)
+            == Some("instructions");
         let input = {
             let mut partial_history = vec![];
             if let Some(docs) = req.normalized_documents() {
@@ -855,14 +862,16 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
             }
             partial_history.extend(req.chat_history);
 
-            // Initialize full history with preamble (or empty if non-existent)
-            // Some "Responses API compatible" providers don't support `instructions` field
-            // so we need to add a system message until further notice
-            let mut full_history: Vec<InputItem> = if let Some(content) = req.preamble {
-                vec![InputItem::system_message(content)]
-            } else {
-                Vec::new()
-            };
+            // Compatible gateways disagree on whether the preamble belongs in
+            // the standard `instructions` field or in an input system message.
+            // Keep the historical system-message default; callers that probed
+            // instructions support opt in through an internal, consumed knob.
+            let mut full_history: Vec<InputItem> =
+                if !use_instructions && let Some(content) = req.preamble.as_ref() {
+                    vec![InputItem::system_message(content.clone())]
+                } else {
+                    Vec::new()
+                };
 
             for history_item in partial_history {
                 full_history.extend(<Vec<InputItem>>::try_from(history_item)?);
@@ -886,7 +895,19 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
 
         let mut additional_tools = Vec::new();
         let mut max_output_tokens_override: Option<Option<u64>> = None;
+        let mut temperature_override: Option<Option<f64>> = None;
         if let Some(additional_params_map) = additional_params_payload.as_object_mut() {
+            if let Some(raw_transport) = additional_params_map.remove("_rig_preamble_transport") {
+                match raw_transport.as_str() {
+                    Some("instructions" | "system_message") => {}
+                    _ => {
+                        return Err(CompletionError::RequestError(
+                            "Invalid OpenAI Responses _rig_preamble_transport; expected instructions or system_message"
+                                .into(),
+                        ));
+                    }
+                }
+            }
             if let Some(raw_tools) = additional_params_map.remove("tools") {
                 additional_tools = serde_json::from_value::<Vec<ResponsesToolDefinition>>(
                     raw_tools,
@@ -912,6 +933,20 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
                                     "Invalid OpenAI Responses max_output_tokens override: {err}"
                                 )
                                 .into(),
+                            )
+                        })?,
+                    )
+                });
+            }
+            if let Some(raw_temperature) = additional_params_map.remove("temperature") {
+                temperature_override = Some(if raw_temperature.is_null() {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_value::<f64>(raw_temperature).map_err(|err| {
+                            CompletionError::RequestError(
+                                format!("Invalid OpenAI Responses temperature override: {err}")
+                                    .into(),
                             )
                         })?,
                     )
@@ -976,12 +1011,12 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
         Ok(Self {
             input,
             model,
-            instructions: None, // is currently None due to lack of support in compliant providers
+            instructions: use_instructions.then(|| req.preamble).flatten(),
             max_output_tokens: max_output_tokens_override.unwrap_or(req.max_tokens),
             stream,
             tool_choice,
             tools,
-            temperature: req.temperature,
+            temperature: temperature_override.unwrap_or(req.temperature),
             additional_parameters,
         })
     }
@@ -2626,6 +2661,43 @@ mod tests {
         assert_eq!(request.max_output_tokens, None);
         let value = serde_json::to_value(request).expect("request should serialize");
         assert!(value.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn additional_params_select_instructions_and_omit_temperature() {
+        let request = crate::completion::CompletionRequest {
+            model: None,
+            preamble: Some("System contract".into()),
+            chat_history: OneOrMany::one(completion::Message::User {
+                content: OneOrMany::one(message::UserContent::Text(Text::new("Reply OK"))),
+            }),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: Some(0.7),
+            max_tokens: Some(64),
+            tool_choice: None,
+            additional_params: Some(json!({
+                "_rig_preamble_transport": "instructions",
+                "temperature": null,
+            })),
+            output_schema: None,
+        };
+
+        let request = CompletionRequest::try_from(("gpt-compatible".to_string(), request))
+            .expect("request should convert");
+        assert_eq!(request.instructions.as_deref(), Some("System contract"));
+        assert_eq!(request.temperature, None);
+        let value = serde_json::to_value(request).expect("request should serialize");
+        assert!(value.get("temperature").is_none());
+        assert_eq!(value["instructions"], json!("System contract"));
+        assert!(
+            !value["input"]
+                .as_array()
+                .expect("input array")
+                .iter()
+                .any(|item| item.get("role") == Some(&json!("system")))
+        );
+        assert!(value.get("_rig_preamble_transport").is_none());
     }
 
     #[test]
