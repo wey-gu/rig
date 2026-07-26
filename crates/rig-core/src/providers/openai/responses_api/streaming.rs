@@ -257,6 +257,7 @@ struct RawChoiceAccumulator {
     final_usage: ResponsesUsage,
     tool_calls: Vec<StreamingRawChoice>,
     tool_call_internal_ids: std::collections::HashMap<String, String>,
+    emitted_text_parts: std::collections::HashSet<(u64, u64)>,
 }
 
 impl RawChoiceAccumulator {
@@ -265,6 +266,7 @@ impl RawChoiceAccumulator {
             final_usage: initial_usage,
             tool_calls: Vec::new(),
             tool_call_internal_ids: std::collections::HashMap::new(),
+            emitted_text_parts: std::collections::HashSet::new(),
         }
     }
 
@@ -277,6 +279,7 @@ impl RawChoiceAccumulator {
 
         let ItemChunk {
             item_id: outer_item_id,
+            output_index,
             data: item,
             ..
         } = chunk;
@@ -305,7 +308,17 @@ impl RawChoiceAccumulator {
                 );
             }
             ItemChunkKind::OutputTextDelta(delta) => {
+                self.emitted_text_parts
+                    .insert((output_index, delta.content_index));
                 immediate.push(streaming::RawStreamingChoice::Message(delta.delta));
+            }
+            ItemChunkKind::OutputTextDone(done) => {
+                if self
+                    .emitted_text_parts
+                    .insert((output_index, done.content_index))
+                {
+                    immediate.push(streaming::RawStreamingChoice::Message(done.text));
+                }
             }
             ItemChunkKind::ReasoningSummaryTextDelta(delta) => {
                 immediate.push(streaming::RawStreamingChoice::ReasoningDelta {
@@ -314,7 +327,17 @@ impl RawChoiceAccumulator {
                 });
             }
             ItemChunkKind::RefusalDelta(delta) => {
+                self.emitted_text_parts
+                    .insert((output_index, delta.content_index));
                 immediate.push(streaming::RawStreamingChoice::Message(delta.delta));
+            }
+            ItemChunkKind::RefusalDone(done) => {
+                if self
+                    .emitted_text_parts
+                    .insert((output_index, done.content_index))
+                {
+                    immediate.push(streaming::RawStreamingChoice::Message(done.refusal));
+                }
             }
             ItemChunkKind::FunctionCallArgsDelta(delta) => {
                 if let Some(item_id) = outer_item_id {
@@ -342,9 +365,11 @@ impl RawChoiceAccumulator {
         response: CompletionResponse,
         provider_name: &str,
         options: ResponsesStreamOptions,
+        immediate: &mut Vec<StreamingRawChoice>,
     ) -> Result<(), CompletionError> {
         match kind {
             ResponseChunkKind::ResponseCompleted => {
+                self.push_unseen_response_text(&response, immediate);
                 if let Some(usage) = response.usage {
                     self.final_usage = usage;
                 }
@@ -363,6 +388,31 @@ impl RawChoiceAccumulator {
                 Err(CompletionError::ProviderError(error_message))
             }
             _ => Ok(()),
+        }
+    }
+
+    fn push_unseen_response_text(
+        &mut self,
+        response: &CompletionResponse,
+        immediate: &mut Vec<StreamingRawChoice>,
+    ) {
+        for (output_index, output) in response.output.iter().enumerate() {
+            let Output::Message(message) = output else {
+                continue;
+            };
+            for (content_index, content) in message.content.iter().enumerate() {
+                let key = (output_index as u64, content_index as u64);
+                if !self.emitted_text_parts.insert(key) {
+                    continue;
+                }
+                let text = match content {
+                    super::AssistantContent::OutputText(text) => text.text.as_str(),
+                    super::AssistantContent::Refusal { refusal } => refusal.as_str(),
+                };
+                if !text.is_empty() {
+                    immediate.push(streaming::RawStreamingChoice::Message(text.to_owned()));
+                }
+            }
         }
     }
 
@@ -447,7 +497,13 @@ pub(crate) fn raw_choices_from_sse_body(
                 }
                 StreamingCompletionChunk::Response(chunk) => {
                     let ResponseChunk { kind, response, .. } = *chunk;
-                    accumulator.record_response_chunk(kind, response, provider_name, options)?;
+                    accumulator.record_response_chunk(
+                        kind,
+                        response,
+                        provider_name,
+                        options,
+                        &mut raw_choices,
+                    )?;
                 }
             }
             continue;
@@ -528,7 +584,13 @@ pub(crate) fn raw_choices_from_sse_body(
                     }) else {
                         continue;
                     };
-                    accumulator.record_response_chunk(kind, response, provider_name, options)?;
+                    accumulator.record_response_chunk(
+                        kind,
+                        response,
+                        provider_name,
+                        options,
+                        &mut raw_choices,
+                    )?;
                 }
             }
             Some("error") => {
@@ -686,12 +748,21 @@ where
                                 span.record("gen_ai.response.id", response.id.as_str());
                                 span.record("gen_ai.response.model", response.model.as_str());
                             }
-                            if let Err(error) =
-                                accumulator.record_response_chunk(kind, response, provider_name, options)
+                            let mut completed_choices = Vec::new();
+                            if let Err(error) = accumulator.record_response_chunk(
+                                kind,
+                                response,
+                                provider_name,
+                                options,
+                                &mut completed_choices,
+                            )
                             {
                                 terminated_with_error = true;
                                 yield Err(error);
                                 break;
+                            }
+                            for choice in completed_choices {
+                                yield Ok(choice);
                             }
                         }
                     }
@@ -1001,6 +1072,89 @@ mod tests {
         }
 
         panic!("stream should yield a final response");
+    }
+
+    async fn streamed_text_from_events(events: &[serde_json::Value]) -> String {
+        let client = openai::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(events),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut text = String::new();
+
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::Text(delta) =
+                item.expect("stream should complete successfully")
+            {
+                text.push_str(&delta.text);
+            }
+        }
+        text
+    }
+
+    fn completed_text_event(text: &str) -> serde_json::Value {
+        let mut response = sample_response(ResponseStatus::Completed);
+        response.output = serde_json::from_value(json!([{
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": text
+            }]
+        }]))
+        .expect("standard Responses output should deserialize");
+        json!({
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": response,
+        })
+    }
+
+    #[tokio::test]
+    async fn output_text_done_and_completed_do_not_duplicate_deltas() {
+        let text = streamed_text_from_events(&[
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "sequence_number": 1,
+                "delta": "he"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "sequence_number": 2,
+                "delta": "llo"
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "sequence_number": 3,
+                "text": "hello"
+            }),
+            completed_text_event("hello"),
+        ])
+        .await;
+
+        assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn completed_response_text_is_a_fallback_when_deltas_are_absent() {
+        let text = streamed_text_from_events(&[completed_text_event("hello")]).await;
+        assert_eq!(text, "hello");
     }
 
     #[test]
