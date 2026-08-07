@@ -184,7 +184,11 @@ pub enum Message {
         content: Vec<AssistantContent>,
         // OpenAI-compatible providers expose hidden reasoning on this non-standard
         // field, and some require it to be echoed back on assistant tool-call turns.
-        #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning_content")]
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            rename = "reasoning_content",
+            alias = "reasoning"
+        )]
         reasoning: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         refusal: Option<String>,
@@ -2138,6 +2142,53 @@ mod tests {
         assert_eq!(
             reasoning.first_text(),
             Some("Now I understand the structure better. I need to: ...")
+        );
+    }
+
+    #[test]
+    fn deserialize_openrouter_reasoning_alias_as_structured_reasoning() {
+        let request = r#"
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning": "OpenRouter-style hidden reasoning"
+                    }
+                }
+            ],
+            "created": 1776750378,
+            "model": "deepseek/deepseek-v4-flash-0731",
+            "system_fingerprint": null,
+            "object": "chat.completion",
+            "usage": {
+                "completion_tokens": 300,
+                "prompt_tokens": 40,
+                "total_tokens": 340
+            },
+            "id": "chatcmpl-openrouter-reasoning"
+        }
+        "#;
+        let response = serde_json::from_str::<ApiResponse<CompletionResponse>>(request).unwrap();
+        let ApiResponse::Ok(response) = response else {
+            panic!("expected successful completion response");
+        };
+
+        let response: completion::CompletionResponse<CompletionResponse> =
+            response.try_into().unwrap();
+
+        assert_eq!(response.choice.len(), 1);
+
+        let completion::message::AssistantContent::Reasoning(reasoning) = response.choice.first()
+        else {
+            panic!("expected assistant content to be reasoning");
+        };
+        assert_eq!(
+            reasoning.first_text(),
+            Some("OpenRouter-style hidden reasoning")
         );
     }
 
