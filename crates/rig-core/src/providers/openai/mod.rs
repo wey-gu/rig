@@ -57,7 +57,7 @@ pub(crate) fn sanitize_schema(schema: &mut serde_json::Value) {
 
         // This is required by OpenAI's Responses API when using strict mode.
         // Source: https://platform.openai.com/docs/guides/structured-outputs#additionalproperties-false-must-always-be-set-in-objects
-        if is_object_schema && !obj.contains_key("additionalProperties") {
+        if is_object_schema {
             obj.insert("additionalProperties".to_string(), Value::Bool(false));
         }
 
@@ -172,6 +172,28 @@ mod tests {
         sanitize_schema(&mut schema);
 
         assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn test_sanitize_overwrites_additional_properties_schema_for_strict_mode() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "additionalProperties": {}
+                }
+            },
+            "additionalProperties": { "type": "string" }
+        });
+
+        sanitize_schema(&mut schema);
+
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(
+            schema["properties"]["filters"]["additionalProperties"],
+            json!(false)
+        );
     }
 
     #[test]
