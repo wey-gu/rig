@@ -1721,7 +1721,7 @@ fn sanitize_schema(schema: &mut serde_json::Value) {
         let is_object_schema = obj.get("type") == Some(&Value::String("object".to_string()))
             || obj.contains_key("properties");
 
-        if is_object_schema && !obj.contains_key("additionalProperties") {
+        if is_object_schema {
             obj.insert("additionalProperties".to_string(), Value::Bool(false));
         }
 
@@ -2582,6 +2582,28 @@ mod tests {
     fn unknown_model_uses_conservative_default_max_tokens_fallback() {
         assert_eq!(default_max_tokens_for_model("claude-unknown"), None);
         assert_eq!(default_max_tokens_with_fallback("claude-unknown"), 2_048);
+    }
+
+    #[test]
+    fn sanitize_schema_overwrites_additional_properties_schema_for_strict_mode() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "additionalProperties": {}
+                }
+            },
+            "additionalProperties": { "type": "string" }
+        });
+
+        sanitize_schema(&mut schema);
+
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(
+            schema["properties"]["filters"]["additionalProperties"],
+            json!(false)
+        );
     }
 
     #[test]
