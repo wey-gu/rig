@@ -47,12 +47,21 @@ pub(crate) fn sanitize_schema(schema: &mut serde_json::Value) {
             return;
         }
 
+        if let Some(additional_properties) = obj.remove("additional_properties") {
+            obj.entry("additionalProperties".to_string())
+                .or_insert(additional_properties);
+        }
+
         let is_object_schema = obj.get("type") == Some(&Value::String("object".to_string()))
-            || obj.contains_key("properties");
+            || obj.contains_key("properties")
+            || obj.contains_key("additionalProperties");
 
         // OpenAI requires "properties" on all object schemas, even empty ones.
-        if is_object_schema && !obj.contains_key("properties") {
-            obj.insert("properties".to_string(), Value::Object(Default::default()));
+        if is_object_schema {
+            obj.entry("type".to_string())
+                .or_insert_with(|| Value::String("object".to_string()));
+            obj.entry("properties".to_string())
+                .or_insert_with(|| Value::Object(Default::default()));
         }
 
         // This is required by OpenAI's Responses API when using strict mode.
@@ -193,6 +202,44 @@ mod tests {
         assert_eq!(
             schema["properties"]["filters"]["additionalProperties"],
             json!(false)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_treats_additional_properties_only_schema_as_object() {
+        let mut schema = json!({
+            "additionalProperties": {}
+        });
+
+        sanitize_schema(&mut schema);
+
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["properties"], json!({}));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["required"], json!([]));
+    }
+
+    #[test]
+    fn test_sanitize_normalizes_snake_case_additional_properties() {
+        let mut schema = json!({
+            "properties": {
+                "filters": {
+                    "additional_properties": {}
+                }
+            }
+        });
+
+        sanitize_schema(&mut schema);
+
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(
+            schema["properties"]["filters"],
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+                "required": []
+            })
         );
     }
 
