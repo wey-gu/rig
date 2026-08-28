@@ -1253,6 +1253,62 @@ mod tests {
     }
 
     #[test]
+    fn function_call_name_is_emitted_once_when_added_and_done_are_both_present() {
+        let added = json!({
+            "type": "response.output_item.added",
+            "item_id": "fc_123",
+            "output_index": 0,
+            "sequence_number": 1,
+            "item": {
+                "type": "function_call",
+                "id": "fc_123",
+                "arguments": "",
+                "call_id": "call_123",
+                "name": "search",
+                "status": "in_progress"
+            }
+        });
+        let done = json!({
+            "type": "response.output_item.done",
+            "item_id": "fc_123",
+            "output_index": 0,
+            "sequence_number": 2,
+            "item": {
+                "type": "function_call",
+                "id": "fc_123",
+                "arguments": "{}",
+                "call_id": "call_123",
+                "name": "search",
+                "status": "completed"
+            }
+        });
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": sample_response(ResponseStatus::Completed),
+        });
+        let body =
+            String::from_utf8(sse_bytes_from_json_events(&[added, done, completed]).to_vec())
+                .expect("mock SSE body should be UTF-8");
+        let choices = super::raw_choices_from_sse_body(&body, ResponsesUsage::new(), "OpenAI")
+            .expect("Responses stream should parse");
+        let name_count = choices
+            .iter()
+            .filter(|choice| {
+                matches!(
+                    choice,
+                    RawStreamingChoice::ToolCallDelta {
+                        content: crate::streaming::ToolCallDeltaContent::Name(name),
+                        ..
+                    } if name == "search"
+                )
+            })
+            .count();
+
+        assert_eq!(name_count, 1);
+    }
+
+    #[test]
     fn reasoning_done_item_emits_summary_then_encrypted() {
         let summary = vec![
             ReasoningSummary::SummaryText {
