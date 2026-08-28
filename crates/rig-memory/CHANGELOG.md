@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.40.0](https://github.com/wey-gu/rig/compare/rig-memory-v0.39.0...rig-memory-v0.40.0) - 2026-08-28
+
+### Added
+
+- *(memory)* add Compactor trait, CompactingMemory adapter, and TemplateCompactor ([#1748](https://github.com/wey-gu/rig/pull/1748)) (by @ForeverAngry)
+- *(memory)* Rig-managed conversation memory + rig-memory companion crate ([#1702](https://github.com/wey-gu/rig/pull/1702)) (by @ForeverAngry)
+
+### Other
+
+- release v0.39.0 ([#1888](https://github.com/wey-gu/rig/pull/1888)) (by @github-actions[bot]) - #1888
+- release v0.38.2 ([#1854](https://github.com/wey-gu/rig/pull/1854)) (by @github-actions[bot]) - #1854
+- release ([#1851](https://github.com/wey-gu/rig/pull/1851)) (by @github-actions[bot]) - #1851
+- unify workspace crate versions ([#1853](https://github.com/wey-gu/rig/pull/1853)) (by @gold-silver-copper) - #1853
+- release ([#1765](https://github.com/wey-gu/rig/pull/1765)) (by @github-actions[bot]) - #1765
+- release ([#1692](https://github.com/wey-gu/rig/pull/1692)) (by @github-actions[bot]) - #1692
+- Memory adapter cancellation safety and trait-object forwarding ([#1756](https://github.com/wey-gu/rig/pull/1756)) (by @gold-silver-copper) - #1756
+- Add demotion hooks for bounded conversation memory ([#1737](https://github.com/wey-gu/rig/pull/1737)) (by @ForeverAngry) - #1737
+
+### Contributors
+
+* @github-actions[bot]
+* @gold-silver-copper
+* @ForeverAngry
 ## [0.38.1](https://github.com/0xPlaygrounds/rig/compare/rig-memory-v0.1.2...rig-memory-v0.38.1) - 2026-06-02
 
 ### Other
