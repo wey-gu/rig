@@ -4841,6 +4841,7 @@ mod tests {
                 .is_some_and(|id| !id.is_empty()),
             "completed call must retain an internal call id"
         );
+        assert_eq!(completed_internal_call_id.as_deref(), Some("internal_1"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(final_response.as_deref(), Some("done"));
     }

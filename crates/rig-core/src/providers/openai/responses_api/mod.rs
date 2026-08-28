@@ -1011,7 +1011,7 @@ impl TryFrom<(String, crate::completion::CompletionRequest)> for CompletionReque
         Ok(Self {
             input,
             model,
-            instructions: use_instructions.then(|| req.preamble).flatten(),
+            instructions: use_instructions.then_some(req.preamble).flatten(),
             max_output_tokens: max_output_tokens_override.unwrap_or(req.max_tokens),
             stream,
             tool_choice,
