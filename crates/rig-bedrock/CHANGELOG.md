@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.40.0](https://github.com/wey-gu/rig/compare/rig-bedrock-v0.39.0...rig-bedrock-v0.40.0) - 2026-08-28
+
+### Added
+
+- *(rig-core)* [**breaking**] broaden provider error-response inspection workspace-wide ([#1944](https://github.com/wey-gu/rig/pull/1944)) (by @gold-silver-copper)
+- *(agent)* [**breaking**] sans-IO AgentRun state machine; both agent loops become thin drivers ([#1899](https://github.com/wey-gu/rig/pull/1899)) (by @gold-silver-copper)
+- *(gemini)* expose streaming response metadata ([#1790](https://github.com/wey-gu/rig/pull/1790)) (by @mateobelanger)
+- *(anthropic)* support document citations ([#1778](https://github.com/wey-gu/rig/pull/1778))
+- *(rig-bedrock)* add structured output support via Converse API ([#1667](https://github.com/wey-gu/rig/pull/1667)) (by @jdwil)
+
+### Fixed
+
+- *(gemini)* Token usage correctness for posthog llm analytics ([#1761](https://github.com/wey-gu/rig/pull/1761)) (by @mateobelanger)
+
+### Other
+
+- *(rig-core)* replace nanoid with fastrand for internal IDs ([#1938](https://github.com/wey-gu/rig/pull/1938)) (by @gold-silver-copper)
+- release v0.39.0 ([#1888](https://github.com/wey-gu/rig/pull/1888)) (by @github-actions[bot]) - #1888
+- release v0.38.2 ([#1854](https://github.com/wey-gu/rig/pull/1854)) (by @github-actions[bot]) - #1854
+- release ([#1851](https://github.com/wey-gu/rig/pull/1851)) (by @github-actions[bot]) - #1851
+- unify workspace crate versions ([#1853](https://github.com/wey-gu/rig/pull/1853)) (by @gold-silver-copper) - #1853
+- release ([#1765](https://github.com/wey-gu/rig/pull/1765)) (by @github-actions[bot]) - #1765
+- release ([#1692](https://github.com/wey-gu/rig/pull/1692)) (by @github-actions[bot]) - #1692
+- fix "a ancient" grammar in glarb-glarb sample text ([#1755](https://github.com/wey-gu/rig/pull/1755)) (by @abhicris) - #1755
+- AGENTS.MD, CONTRIBUTING.MD, and docs ([#1714](https://github.com/wey-gu/rig/pull/1714)) (by @gold-silver-copper) - #1714
+- improve project organization and create rig crate ([#1699](https://github.com/wey-gu/rig/pull/1699)) (by @gold-silver-copper) - #1699
+
+### Contributors
+
+* @gold-silver-copper
+* @github-actions[bot]
+* @mateobelanger
+* @abhicris
+* @jdwil
 ## [0.39.0](https://github.com/0xPlaygrounds/rig/compare/rig-bedrock-v0.38.2...rig-bedrock-v0.39.0) - 2026-06-19
 
 ### Added

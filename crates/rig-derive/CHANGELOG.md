@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.40.0](https://github.com/wey-gu/rig/compare/rig-derive-v0.39.0...rig-derive-v0.40.0) - 2026-08-28
+
+### Added
+
+- *(rig-derive)* replace hand-rolled schema with schemars in #[rig_tool] ([#1576](https://github.com/wey-gu/rig/pull/1576)) (by @tomasz-feliksik)
+
+### Other
+
+- release v0.38.2 ([#1854](https://github.com/wey-gu/rig/pull/1854)) (by @github-actions[bot]) - #1854
+- release ([#1851](https://github.com/wey-gu/rig/pull/1851)) (by @github-actions[bot]) - #1851
+- unify workspace crate versions ([#1853](https://github.com/wey-gu/rig/pull/1853)) (by @gold-silver-copper) - #1853
+- release ([#1765](https://github.com/wey-gu/rig/pull/1765)) (by @github-actions[bot]) - #1765
+- release ([#1692](https://github.com/wey-gu/rig/pull/1692)) (by @github-actions[bot]) - #1692
+- improve project organization and create rig crate ([#1699](https://github.com/wey-gu/rig/pull/1699)) (by @gold-silver-copper) - #1699
+
+### Contributors
+
+* @github-actions[bot]
+* @gold-silver-copper
+* @tomasz-feliksik
 ## [0.38.2](https://github.com/0xPlaygrounds/rig/compare/rig-derive-v0.38.1...rig-derive-v0.38.2) - 2026-06-09
 
 ### Other

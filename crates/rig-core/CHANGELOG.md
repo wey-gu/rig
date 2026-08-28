@@ -6,6 +6,138 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.40.0](https://github.com/wey-gu/rig/compare/rig-core-v0.39.0...rig-core-v0.40.0) - 2026-08-28
+
+### Added
+
+- *(rig-core)* concurrent tool execution in the streaming driver (parity with blocking tool_concurrency) ([#1957](https://github.com/wey-gu/rig/pull/1957)) (by @gold-silver-copper)
+- *(rig-core)* ToolCallExtensions — per-call tool context through the agent loop, MCP & sub-agents (supersedes #1537, #1953) ([#1954](https://github.com/wey-gu/rig/pull/1954)) (by @gold-silver-copper)
+- *(openai)* preserve responses prompt cache parameters ([#1830](https://github.com/wey-gu/rig/pull/1830)) (by @Kade-Powell)
+- *(streaming)* [**breaking**] surface unmodeled provider output items through the stream ([#1951](https://github.com/wey-gu/rig/pull/1951)) (by @gold-silver-copper)
+- *(openai-responses)* [**breaking**] preserve unknown Output payloads ([#1950](https://github.com/wey-gu/rig/pull/1950)) (by @gold-silver-copper)
+- *(rig-core)* [**breaking**] integrate hooks into AgentRun via a composable AgentRunner ([#1945](https://github.com/wey-gu/rig/pull/1945)) (by @gold-silver-copper)
+- *(rig-core)* [**breaking**] broaden provider error-response inspection workspace-wide ([#1944](https://github.com/wey-gu/rig/pull/1944)) (by @gold-silver-copper)
+- *(message)* add video helper constructors + OpenRouter audio/video conversion tests ([#1942](https://github.com/wey-gu/rig/pull/1942)) (by @gold-silver-copper)
+- *(rig-core)* [**breaking**] expose provider error response inspection ([#1859](https://github.com/wey-gu/rig/pull/1859)) (by @Shaurya-Sethi)
+- *(agent)* add OutputMode to compose structured output with tools ([#1928](https://github.com/wey-gu/rig/pull/1928)) ([#1929](https://github.com/wey-gu/rig/pull/1929)) (by @gold-silver-copper)
+- *(providers)* add VoyageAI rerank support ([#1917](https://github.com/wey-gu/rig/pull/1917)) (by @sergiomeneses)
+- *(agent)* [**breaking**] sans-IO AgentRun state machine; both agent loops become thin drivers ([#1899](https://github.com/wey-gu/rig/pull/1899)) (by @gold-silver-copper)
+- *(rig-derive)* replace hand-rolled schema with schemars in #[rig_tool] ([#1576](https://github.com/wey-gu/rig/pull/1576)) (by @tomasz-feliksik)
+- *(embeddings)* expose token usage via embed_texts_with_usage ([#1791](https://github.com/wey-gu/rig/pull/1791)) (by @sergiomeneses)
+- *(openrouter)* add prompt-caching support ([#1832](https://github.com/wey-gu/rig/pull/1832)) (by @gold-silver-copper)
+- *(openrouter)* add with_app_identity and with_app_categories builders for app attribution ([#1806](https://github.com/wey-gu/rig/pull/1806)) (by @jimmiebfulton)
+- *(openrouter)* surface cache token accounting in Usage ([#1808](https://github.com/wey-gu/rig/pull/1808)) (by @jimmiebfulton)
+- *(gemini)* expose streaming response metadata ([#1790](https://github.com/wey-gu/rig/pull/1790)) (by @mateobelanger)
+- *(anthropic)* support document citations ([#1778](https://github.com/wey-gu/rig/pull/1778))
+- *(gemini)* expose finish_reason and model_version on StreamingCompletionResponse ([#1776](https://github.com/wey-gu/rig/pull/1776)) (by @mateobelanger)
+- *(openrouter)* add transcription (STT) and audio generation (TTS) support ([#1757](https://github.com/wey-gu/rig/pull/1757)) (by @fversaci)
+- *(memory)* add Compactor trait, CompactingMemory adapter, and TemplateCompactor ([#1748](https://github.com/wey-gu/rig/pull/1748)) (by @ForeverAngry)
+- *(ollama)* Enhance `think` parameter with string levels ([#1747](https://github.com/wey-gu/rig/pull/1747)) (by @cobaltburn)
+- *(memory)* Rig-managed conversation memory + rig-memory companion crate ([#1702](https://github.com/wey-gu/rig/pull/1702)) (by @ForeverAngry)
+- add copilot model listing ([#1700](https://github.com/wey-gu/rig/pull/1700)) (by @BigtoC) - #1700
+
+### Fixed
+
+- *(responses)* recover tool names from completed items ([#2](https://github.com/wey-gu/rig/pull/2)) (by @wey-gu)
+- *(rig-core)* fix epub loader tests + prevent CWD-relative fixture-path regressions ([#1940](https://github.com/wey-gu/rig/pull/1940)) (by @gold-silver-copper)
+- *(gemini)* default totalTokenCount to avoid deser crash on empty generations ([#1936](https://github.com/wey-gu/rig/pull/1936)) (by @gold-silver-copper)
+- *(ollama)* preserve assistant reasoning from non-streaming responses ([#1926](https://github.com/wey-gu/rig/pull/1926)) ([#1927](https://github.com/wey-gu/rig/pull/1927)) (by @gold-silver-copper)
+- *(rmcp)* bound MCP tool calls with a default, configurable, wasm-friendly timeout ([#1914](https://github.com/wey-gu/rig/pull/1914)) ([#1921](https://github.com/wey-gu/rig/pull/1921)) (by @gold-silver-copper)
+- *(tool)* [**breaking**] deterministic, duplicate-safe tool registration + cassette tests ([#1913](https://github.com/wey-gu/rig/pull/1913)) (by @gold-silver-copper)
+- *(streaming)* record per-call token usage on chat generation spans ([#1880](https://github.com/wey-gu/rig/pull/1880)) (by @mateobelanger)
+- support Anthropic mid-conversation system role ([#1862](https://github.com/wey-gu/rig/pull/1862)) (by @fangkangmi) - #1862
+- *(openai)* make token usage details optional in responses API ([#1857](https://github.com/wey-gu/rig/pull/1857)) (by @sosal123tyu1)
+- *(openai)* tolerate object-form tool-call `arguments` in streaming ([#1822](https://github.com/wey-gu/rig/pull/1822)) (by @xavierforge)
+- *(chatgpt)* Handle ChatGPT response.completed events without output field ([#1825](https://github.com/wey-gu/rig/pull/1825)) (by @geraschenko)
+- *(rig-core)* Expose tools added via ToolServerHandle::append_toolset ([#1837](https://github.com/wey-gu/rig/pull/1837)) (by @mccormickt)
+- avoid duplicate streaming reasoning history ([#1849](https://github.com/wey-gu/rig/pull/1849)) (by @gold-silver-copper) - #1849
+- *(rig-gemini-grpc)* populate FunctionDeclaration.parameters from ToolDefinition ([#1763](https://github.com/wey-gu/rig/pull/1763)) (by @abhicris)
+- *(openrouter)* avoid replaying generated images ([#1835](https://github.com/wey-gu/rig/pull/1835)) (by @gold-silver-copper)
+- *(openrouter)* accept Gemini model role responses ([#1800](https://github.com/wey-gu/rig/pull/1800)) (by @puneetdixit200)
+- *(tools)* safely normalize null tool call arguments ([#1814](https://github.com/wey-gu/rig/pull/1814)) (by @gold-silver-copper)
+- *(ollama)* buffer NDJSON streaming across HTTP chunk boundaries bytes_stream may split a single NDJSON line across chunks, causing serde_json::from_slice to fail mid-stream with an EOF error on longer assistant messages ([#1759](https://github.com/wey-gu/rig/pull/1759)) (by @ChadBartley)
+- *(gemini)* record tool use prompt token telemetry ([#1799](https://github.com/wey-gu/rig/pull/1799)) (by @gold-silver-copper)
+- default OpenAI base64 image detail ([#1781](https://github.com/wey-gu/rig/pull/1781)) (by @fangkangmi) - #1781
+- stream ToolCallDelta in prompt_request ([#1789](https://github.com/wey-gu/rig/pull/1789)) (by @notV4l) - #1789
+- fix sqlite threshold and null tool call streaming ([#1786](https://github.com/wey-gu/rig/pull/1786)) (by @gold-silver-copper) - #1786
+- *(anthropic)* serialize ToolResultContent::Image with source wrapper ([#1772](https://github.com/wey-gu/rig/pull/1772)) (by @Cyanistic)
+- *(gemini)* Token usage correctness for posthog llm analytics ([#1761](https://github.com/wey-gu/rig/pull/1761)) (by @mateobelanger)
+- *(openrouter)* skip serializing empty content in Assistant messages ([#1735](https://github.com/wey-gu/rig/pull/1735)) (by @pablof7z)
+- *(openai)* send PDF Documents as file parts in chat completions ([#1732](https://github.com/wey-gu/rig/pull/1732)) (by @fangkangmi)
+- *(core)* [**breaking**] make Chat append messages to caller history ([#1733](https://github.com/wey-gu/rig/pull/1733)) (by @gold-silver-copper)
+- added a trailing newline after streamed agent response. The AgentImpl::request method streams tokens using print! macro with no trailing newline, so when the stream ends, the run loop prints the closing separator immediately which causes it to appear on the same line as the last response token - So added a println!() to the None arm of the streaming loop so a newline is always emitted after the final chunk which matches the ChatImpl path that uses println. ([#1712](https://github.com/wey-gu/rig/pull/1712)) (by @Shaurya-Sethi) - #1712
+- *(mistral)* expose cached and audio token fields in Usage ([#1725](https://github.com/wey-gu/rig/pull/1725)) (by @byQuexo)
+
+### Other
+
+- *(rig-core)* [**breaking**] remove the experimental pipeline module ([#1941](https://github.com/wey-gu/rig/pull/1941)) (by @gold-silver-copper)
+- *(rig-core)* replace nanoid with fastrand for internal IDs ([#1938](https://github.com/wey-gu/rig/pull/1938)) (by @gold-silver-copper)
+- release v0.39.0 ([#1888](https://github.com/wey-gu/rig/pull/1888)) (by @github-actions[bot]) - #1888
+- Only append a slash to base_urls of api providers when they don't already end with a slash. ([#1903](https://github.com/wey-gu/rig/pull/1903)) (by @eriktews) - #1903
+- *(tool)* back ToolSet with an IndexMap instead of HashMap + order Vec ([#1916](https://github.com/wey-gu/rig/pull/1916)) (by @gold-silver-copper)
+- de-flake tracing span tests and deepseek permission_control race ([#1915](https://github.com/wey-gu/rig/pull/1915)) (by @gold-silver-copper) - #1915
+- Fix streaming reasoning history order ([#1898](https://github.com/wey-gu/rig/pull/1898)) (by @gold-silver-copper) - #1898
+- Fix context document ordering ([#1893](https://github.com/wey-gu/rig/pull/1893)) (by @gold-silver-copper) - #1893
+- Add Gemini Nano Banana image generation ([#1889](https://github.com/wey-gu/rig/pull/1889)) (by @gold-silver-copper) - #1889
+- release v0.38.2 ([#1854](https://github.com/wey-gu/rig/pull/1854)) (by @github-actions[bot]) - #1854
+- Add configurable Copilot intent ([#1883](https://github.com/wey-gu/rig/pull/1883)) (by @gold-silver-copper) - #1883
+- [codex] support mistral.rs OpenAI-compatible reasoning ([#1864](https://github.com/wey-gu/rig/pull/1864)) (by @gold-silver-copper) - #1864
+- [codex] cover Anthropic streaming tool result batching ([#1863](https://github.com/wey-gu/rig/pull/1863)) (by @gold-silver-copper) - #1863
+- release ([#1851](https://github.com/wey-gu/rig/pull/1851)) (by @github-actions[bot]) - #1851
+- unify workspace crate versions ([#1853](https://github.com/wey-gu/rig/pull/1853)) (by @gold-silver-copper) - #1853
+- release ([#1765](https://github.com/wey-gu/rig/pull/1765)) (by @github-actions[bot]) - #1765
+- Unify invalid tool call recovery with prompt hooks ([#1850](https://github.com/wey-gu/rig/pull/1850)) (by @gold-silver-copper) - #1850
+- Fix parsing of streamed function-call argument deltas ([#1828](https://github.com/wey-gu/rig/pull/1828)) (by @geraschenko) - #1828
+- Add invalid tool call recovery hooks ([#1840](https://github.com/wey-gu/rig/pull/1840)) (by @gold-silver-copper) - #1840
+- [codex] Validate model tool calls ([#1823](https://github.com/wey-gu/rig/pull/1823)) (by @gold-silver-copper) - #1823
+- Cap OpenRouter app categories header ([#1821](https://github.com/wey-gu/rig/pull/1821)) (by @gold-silver-copper) - #1821
+- [codex] apply Anthropic cache control to tools ([#1815](https://github.com/wey-gu/rig/pull/1815)) (by @gold-silver-copper) - #1815
+- Expose per-completion-call usage in agent responses ([#1787](https://github.com/wey-gu/rig/pull/1787)) (by @gold-silver-copper) - #1787
+- Add replayable provider cassette tests ([#1769](https://github.com/wey-gu/rig/pull/1769)) (by @gold-silver-copper) - #1769
+- release ([#1692](https://github.com/wey-gu/rig/pull/1692)) (by @github-actions[bot]) - #1692
+- Clean up root facade features and integration docs ([#1764](https://github.com/wey-gu/rig/pull/1764)) (by @gold-silver-copper) - #1764
+- Improve GenAI token usage telemetry for Gemini and Responses API ([#1762](https://github.com/wey-gu/rig/pull/1762)) (by @gold-silver-copper) - #1762
+- Memory adapter cancellation safety and trait-object forwarding ([#1756](https://github.com/wey-gu/rig/pull/1756)) (by @gold-silver-copper) - #1756
+- Add demotion hooks for bounded conversation memory ([#1737](https://github.com/wey-gu/rig/pull/1737)) (by @ForeverAngry) - #1737
+- Move reusable test doubles into rig_core::test_utils ([#1745](https://github.com/wey-gu/rig/pull/1745)) (by @gold-silver-copper) - #1745
+- workspace and docs cleanup ([#1742](https://github.com/wey-gu/rig/pull/1742)) (by @gold-silver-copper) - #1742
+- openrouter vars ([#1741](https://github.com/wey-gu/rig/pull/1741)) (by @gold-silver-copper) - #1741
+- Add provider file ID support for document inputs ([#1740](https://github.com/wey-gu/rig/pull/1740)) (by @gold-silver-copper) - #1740
+- bump dependencies ([#1728](https://github.com/wey-gu/rig/pull/1728)) (by @gold-silver-copper) - #1728
+- Add a support of structured output for OpenRouter ([#1718](https://github.com/wey-gu/rig/pull/1718)) (by @Mnwa) - #1718
+- set doctest to true, and update doc comments ([#1716](https://github.com/wey-gu/rig/pull/1716)) (by @gold-silver-copper) - #1716
+- AGENTS.MD, CONTRIBUTING.MD, and docs ([#1714](https://github.com/wey-gu/rig/pull/1714)) (by @gold-silver-copper) - #1714
+- improve project organization and create rig crate ([#1699](https://github.com/wey-gu/rig/pull/1699)) (by @gold-silver-copper) - #1699
+
+### Contributors
+
+* @wey-gu
+* @gold-silver-copper
+* @Kade-Powell
+* @Shaurya-Sethi
+* @github-actions[bot]
+* @eriktews
+* @sergiomeneses
+* @mateobelanger
+* @fangkangmi
+* @sosal123tyu1
+* @xavierforge
+* @geraschenko
+* @mccormickt
+* @tomasz-feliksik
+* @abhicris
+* @jimmiebfulton
+* @puneetdixit200
+* @ChadBartley
+* @notV4l
+* @Cyanistic
+* @fversaci
+* @ForeverAngry
+* @cobaltburn
+* @pablof7z
+* @BigtoC
+* @Mnwa
+* @byQuexo
 
 ### Added
 

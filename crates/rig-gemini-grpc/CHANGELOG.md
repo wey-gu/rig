@@ -35,6 +35,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Contributors
 
 * @gold-silver-copper
+## [0.40.0](https://github.com/wey-gu/rig/compare/rig-gemini-grpc-v0.39.0...rig-gemini-grpc-v0.40.0) - 2026-08-28
+
+### Added
+
+- *(rig-core)* [**breaking**] broaden provider error-response inspection workspace-wide ([#1944](https://github.com/wey-gu/rig/pull/1944)) (by @gold-silver-copper)
+- *(agent)* [**breaking**] sans-IO AgentRun state machine; both agent loops become thin drivers ([#1899](https://github.com/wey-gu/rig/pull/1899)) (by @gold-silver-copper)
+- *(gemini)* expose streaming response metadata ([#1790](https://github.com/wey-gu/rig/pull/1790)) (by @mateobelanger)
+- *(anthropic)* support document citations ([#1778](https://github.com/wey-gu/rig/pull/1778))
+
+### Fixed
+
+- *(rig-gemini-grpc)* populate FunctionDeclaration.parameters from ToolDefinition ([#1763](https://github.com/wey-gu/rig/pull/1763)) (by @abhicris)
+- *(gemini)* Token usage correctness for posthog llm analytics ([#1761](https://github.com/wey-gu/rig/pull/1761)) (by @mateobelanger)
+
+### Other
+
+- release v0.39.0 ([#1888](https://github.com/wey-gu/rig/pull/1888)) (by @github-actions[bot]) - #1888
+- release v0.38.2 ([#1854](https://github.com/wey-gu/rig/pull/1854)) (by @github-actions[bot]) - #1854
+- release ([#1851](https://github.com/wey-gu/rig/pull/1851)) (by @github-actions[bot]) - #1851
+- unify workspace crate versions ([#1853](https://github.com/wey-gu/rig/pull/1853)) (by @gold-silver-copper) - #1853
+- release ([#1765](https://github.com/wey-gu/rig/pull/1765)) (by @github-actions[bot]) - #1765
+- release ([#1692](https://github.com/wey-gu/rig/pull/1692)) (by @github-actions[bot]) - #1692
+- bump dependencies ([#1728](https://github.com/wey-gu/rig/pull/1728)) (by @gold-silver-copper) - #1728
+- AGENTS.MD, CONTRIBUTING.MD, and docs ([#1714](https://github.com/wey-gu/rig/pull/1714)) (by @gold-silver-copper) - #1714
+- improve project organization and create rig crate ([#1699](https://github.com/wey-gu/rig/pull/1699)) (by @gold-silver-copper) - #1699
+
+### Contributors
+
+* @gold-silver-copper
+* @github-actions[bot]
+* @abhicris
+* @mateobelanger
 
 ## [0.38.2](https://github.com/0xPlaygrounds/rig/compare/rig-gemini-grpc-v0.38.1...rig-gemini-grpc-v0.38.2) - 2026-06-09
 

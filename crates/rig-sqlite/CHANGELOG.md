@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.40.0](https://github.com/wey-gu/rig/compare/rig-sqlite-v0.39.0...rig-sqlite-v0.40.0) - 2026-08-28
+
+### Fixed
+
+- *(sqlite)* brute-force scan when KNN candidate count exceeds sqlite-vec's k cap ([#1920](https://github.com/wey-gu/rig/pull/1920)) (by @gold-silver-copper)
+- *(sqlite)* deserialize JSON columns ([#1797](https://github.com/wey-gu/rig/pull/1797)) (by @gold-silver-copper)
+- *(sqlite)* support document metadata filters ([#1793](https://github.com/wey-gu/rig/pull/1793)) (by @gold-silver-copper)
+- fix sqlite threshold and null tool call streaming ([#1786](https://github.com/wey-gu/rig/pull/1786)) (by @gold-silver-copper) - #1786
+
+### Other
+
+- run doctests and stop rig-sqlite opting out of them ([#1939](https://github.com/wey-gu/rig/pull/1939)) (by @gold-silver-copper) - #1939
+- release v0.39.0 ([#1888](https://github.com/wey-gu/rig/pull/1888)) (by @github-actions[bot]) - #1888
+- release v0.38.2 ([#1854](https://github.com/wey-gu/rig/pull/1854)) (by @github-actions[bot]) - #1854
+- release ([#1851](https://github.com/wey-gu/rig/pull/1851)) (by @github-actions[bot]) - #1851
+- unify workspace crate versions ([#1853](https://github.com/wey-gu/rig/pull/1853)) (by @gold-silver-copper) - #1853
+- release ([#1765](https://github.com/wey-gu/rig/pull/1765)) (by @github-actions[bot]) - #1765
+- [codex] docs(sqlite): add JSON metadata ergonomics ([#1798](https://github.com/wey-gu/rig/pull/1798)) (by @gold-silver-copper) - #1798
+- release ([#1692](https://github.com/wey-gu/rig/pull/1692)) (by @github-actions[bot]) - #1692
+- fix "a ancient" grammar in glarb-glarb sample text ([#1755](https://github.com/wey-gu/rig/pull/1755)) (by @abhicris) - #1755
+- AGENTS.MD, CONTRIBUTING.MD, and docs ([#1714](https://github.com/wey-gu/rig/pull/1714)) (by @gold-silver-copper) - #1714
+- improve project organization and create rig crate ([#1699](https://github.com/wey-gu/rig/pull/1699)) (by @gold-silver-copper) - #1699
+
+### Contributors
+
+* @gold-silver-copper
+* @github-actions[bot]
+* @abhicris
 ## [0.39.0](https://github.com/0xPlaygrounds/rig/compare/rig-sqlite-v0.38.2...rig-sqlite-v0.39.0) - 2026-06-19
 
 ### Fixed
