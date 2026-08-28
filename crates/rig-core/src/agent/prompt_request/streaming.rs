@@ -4160,7 +4160,7 @@ mod tests {
         let model = MockCompletionModel::from_stream_turns([
             vec![
                 MockStreamEvent::tool_call_name_delta("tool_1", "internal_1", "add"),
-                MockStreamEvent::tool_call_arguments_delta("tool_1", "internal_1", "{\"x\":1}"),
+                MockStreamEvent::tool_call_arguments_delta("tool_1", "internal_1", "{\"x\":"),
                 MockStreamEvent::final_response_with_total_tokens(4),
             ],
             vec![
@@ -4418,6 +4418,88 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_name_then_completed_tool_call_executes_once() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::tool_call_arguments_delta("tool_1", "internal_1", "{\"x\":"),
+                MockStreamEvent::tool_call_name_delta("tool_1", "internal_1", "add"),
+                MockStreamEvent::tool_call_arguments_delta("tool_1", "internal_1", "1}"),
+                MockStreamEvent::tool_call("tool_1", "add", serde_json::json!({"x": 1, "y": 2}))
+                    .with_call_id("call_1"),
+                MockStreamEvent::final_response_with_total_tokens(4),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_total_tokens(6),
+            ],
+        ]);
+        let hook = RecordingToolCallDeltaHook::default();
+        let agent = AgentBuilder::new(model)
+            .tool(CountingAddTool {
+                calls: calls.clone(),
+            })
+            .build();
+
+        let mut stream = agent
+            .stream_prompt("execute the recovered call")
+            .with_hook(hook.clone())
+            .multi_turn(3)
+            .await;
+        let mut completed_internal_call_id = None;
+        let mut final_response = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCall {
+                        internal_call_id, ..
+                    },
+                )) => completed_internal_call_id = Some(internal_call_id),
+                Ok(MultiTurnStreamItem::FinalResponse(response)) => {
+                    final_response = Some(response.response().to_owned());
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => panic!("unexpected streaming error: {err:?}"),
+            }
+        }
+
+        let deltas = hook.observed();
+        assert_eq!(
+            deltas,
+            vec![
+                (
+                    "tool_1".to_string(),
+                    "internal_1".to_string(),
+                    Some("add".to_string()),
+                    String::new()
+                ),
+                (
+                    "tool_1".to_string(),
+                    "internal_1".to_string(),
+                    None,
+                    "{\"x\":".to_string()
+                ),
+                (
+                    "tool_1".to_string(),
+                    "internal_1".to_string(),
+                    None,
+                    "1}".to_string()
+                ),
+            ]
+        );
+        assert!(
+            completed_internal_call_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            "completed call must retain an internal call id"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_response.as_deref(), Some("done"));
     }
 
     #[tokio::test]
