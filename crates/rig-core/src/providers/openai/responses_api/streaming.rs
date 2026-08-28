@@ -205,6 +205,7 @@ struct RawChoiceAccumulator {
     final_usage: ResponsesUsage,
     tool_calls: Vec<StreamingRawChoice>,
     tool_call_internal_ids: std::collections::HashMap<String, String>,
+    emitted_tool_call_names: std::collections::HashSet<String>,
 }
 
 impl RawChoiceAccumulator {
@@ -213,6 +214,23 @@ impl RawChoiceAccumulator {
             final_usage: initial_usage,
             tool_calls: Vec::new(),
             tool_call_internal_ids: std::collections::HashMap::new(),
+            emitted_tool_call_names: std::collections::HashSet::new(),
+        }
+    }
+
+    fn push_tool_call_name(
+        &mut self,
+        id: String,
+        internal_call_id: String,
+        name: String,
+        immediate: &mut Vec<StreamingRawChoice>,
+    ) {
+        if self.emitted_tool_call_names.insert(id.clone()) {
+            immediate.push(streaming::RawStreamingChoice::ToolCallDelta {
+                id,
+                internal_call_id,
+                content: streaming::ToolCallDeltaContent::Name(name),
+            });
         }
     }
 
@@ -239,11 +257,7 @@ impl RawChoiceAccumulator {
                     .entry(func.id.clone())
                     .or_insert_with(crate::id::generate)
                     .clone();
-                immediate.push(streaming::RawStreamingChoice::ToolCallDelta {
-                    id: func.id,
-                    internal_call_id,
-                    content: streaming::ToolCallDeltaContent::Name(func.name),
-                });
+                self.push_tool_call_name(func.id, internal_call_id, func.name, &mut immediate);
             }
             ItemChunkKind::OutputItemDone(message) => {
                 self.push_output_item_done(
@@ -317,6 +331,15 @@ impl RawChoiceAccumulator {
                     .entry(func.id.clone())
                     .or_insert_with(crate::id::generate)
                     .clone();
+                // Some Responses-compatible servers omit output_item.added and
+                // begin with function_call_arguments.delta. The completed item
+                // is the first authoritative tool-name event in that stream.
+                self.push_tool_call_name(
+                    func.id.clone(),
+                    internal_call_id.clone(),
+                    func.name.clone(),
+                    immediate,
+                );
                 let tool_call =
                     streaming::RawStreamingToolCall::new(func.id, func.name, func.arguments)
                         .with_internal_call_id(internal_call_id)
@@ -427,11 +450,12 @@ pub(crate) fn raw_choices_from_sse_body(
                         .entry(func.id.clone())
                         .or_insert_with(crate::id::generate)
                         .clone();
-                    raw_choices.push(streaming::RawStreamingChoice::ToolCallDelta {
-                        id: func.id,
+                    accumulator.push_tool_call_name(
+                        func.id,
                         internal_call_id,
-                        content: streaming::ToolCallDeltaContent::Name(func.name),
-                    });
+                        func.name,
+                        &mut raw_choices,
+                    );
                 }
             }
             Some("response.output_item.done") => {
@@ -941,6 +965,77 @@ mod tests {
         }
 
         panic!("stream should yield a final response");
+    }
+
+    #[tokio::test]
+    async fn function_call_done_recovers_name_when_added_event_is_missing() {
+        let args_delta = json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_123",
+            "output_index": 0,
+            "sequence_number": 1,
+            "delta": "{\"query\":\"hello\"}"
+        });
+        let tool_call_done = json!({
+            "type": "response.output_item.done",
+            "item_id": "fc_123",
+            "output_index": 0,
+            "sequence_number": 2,
+            "item": {
+                "type": "function_call",
+                "id": "fc_123",
+                "arguments": "{\"query\":\"hello\"}",
+                "call_id": "call_123",
+                "name": "search",
+                "status": "completed"
+            }
+        });
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": sample_response(ResponseStatus::Completed),
+        });
+        let client = openai::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[args_delta, tool_call_done, completed]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut saw_name = false;
+        let mut saw_complete_call = false;
+
+        while let Some(item) = stream.next().await {
+            match item.expect("stream should complete successfully") {
+                StreamedAssistantContent::ToolCallDelta { content, .. }
+                    if matches!(
+                        content,
+                        crate::streaming::ToolCallDeltaContent::Name(ref name)
+                            if name == "search"
+                    ) =>
+                {
+                    saw_name = true
+                }
+                StreamedAssistantContent::ToolCall { tool_call, .. }
+                    if tool_call.function.name == "search" =>
+                {
+                    saw_complete_call = true
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_name,
+            "completed item must recover the missing tool name"
+        );
+        assert!(
+            saw_complete_call,
+            "completed function call must remain available for execution"
+        );
     }
 
     #[test]
