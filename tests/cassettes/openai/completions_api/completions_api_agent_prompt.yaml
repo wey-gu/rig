@@ -7,7 +7,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"You are a helpful assistant.","type":"text"}],"role":"system"},{"content":"Hello world!","role":"user"}],"model":"gpt-4o"}'
+  body: '{"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"Hello world!","role":"user"}],"model":"gpt-4o"}'
 then:
   status: 200
   header:

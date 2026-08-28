@@ -7,7 +7,7 @@ when:
     value: text/event-stream
   - name: content-type
     value: application/json
-  body: '{"max_tokens":512,"messages":[{"content":[{"text":"You are concise. Include a few details so streaming is visible.","type":"text"}],"role":"system"},{"content":"Think briefly, then answer with three short bullet points about token usage reporting.","role":"user"}],"model":"Qwen/Qwen3-4B","stream":true,"stream_options":{"include_usage":true}}'
+  body: '{"max_tokens":512,"messages":[{"content":"You are concise. Include a few details so streaming is visible.","role":"system"},{"content":"Think briefly, then answer with three short bullet points about token usage reporting.","role":"user"}],"model":"Qwen/Qwen3-4B","stream":true,"stream_options":{"include_usage":true}}'
 then:
   status: 200
   header:

@@ -7,7 +7,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"Return exactly the requested text as plain text with no bullets, quotes, or extra commentary.","type":"text"}],"role":"system"},{"content":"Reply with exactly two short lines and nothing else. First line: cedar. Second line: maple.","role":"user"}],"model":"gpt-4o"}'
+  body: '{"messages":[{"content":"Return exactly the requested text as plain text with no bullets, quotes, or extra commentary.","role":"system"},{"content":"Reply with exactly two short lines and nothing else. First line: cedar. Second line: maple.","role":"user"}],"model":"gpt-4o"}'
 then:
   status: 200
   header:
