@@ -7,7 +7,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"max_tokens":64,"messages":[{"content":[{"text":"You are concise. Include a few details so streaming is visible.","type":"text"}],"role":"system"},{"content":"/no_think Explain usage accounting in one sentence.","role":"user"}],"model":"Qwen/Qwen3-4B"}'
+  body: '{"max_tokens":64,"messages":[{"content":"You are concise. Include a few details so streaming is visible.","role":"system"},{"content":"/no_think Explain usage accounting in one sentence.","role":"user"}],"model":"Qwen/Qwen3-4B"}'
 then:
   status: 200
   header:
