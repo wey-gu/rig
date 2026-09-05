@@ -99,6 +99,7 @@ impl Authenticator {
     pub fn new(
         source: AuthSource,
         auth_file: Option<PathBuf>,
+        oauth_http_client: Option<reqwest::Client>,
         device_code_handler: DeviceCodeHandler,
         allow_device_flow: bool,
     ) -> Self {
@@ -106,6 +107,7 @@ impl Authenticator {
             source,
             platform: platform::PlatformAuthenticator::new(
                 auth_file,
+                oauth_http_client,
                 device_code_handler,
                 allow_device_flow,
             ),
