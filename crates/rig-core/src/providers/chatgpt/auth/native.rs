@@ -15,10 +15,13 @@ const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
 const DEVICE_CODE_TIMEOUT_SECONDS: i64 = 15 * 60;
 const DEVICE_CODE_POLL_SLEEP_SECONDS: u64 = 5;
+const DEFAULT_OAUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_OAUTH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub(super) struct PlatformAuthenticator {
     auth_file: Option<PathBuf>,
+    http_client: Result<reqwest::Client, String>,
     device_code_handler: DeviceCodeHandler,
     allow_device_flow: bool,
 }
@@ -68,11 +71,15 @@ enum RefreshTokensError {
 impl PlatformAuthenticator {
     pub(super) fn new(
         auth_file: Option<PathBuf>,
+        http_client: Option<reqwest::Client>,
         device_code_handler: DeviceCodeHandler,
         allow_device_flow: bool,
     ) -> Self {
         Self {
             auth_file,
+            http_client: http_client
+                .map(Ok)
+                .unwrap_or_else(default_oauth_http_client),
             device_code_handler,
             allow_device_flow,
         }
@@ -151,12 +158,30 @@ impl PlatformAuthenticator {
     }
 
     async fn login_device_flow(&self) -> Result<AuthRecord, AuthError> {
-        let client = reqwest::Client::new();
-        let device = client
-            .post(CHATGPT_DEVICE_CODE_URL)
+        self.login_device_flow_at(
+            CHATGPT_DEVICE_CODE_URL,
+            CHATGPT_DEVICE_TOKEN_URL,
+            CHATGPT_OAUTH_TOKEN_URL,
+        )
+        .await
+    }
+
+    async fn login_device_flow_at(
+        &self,
+        device_code_url: &str,
+        device_token_url: &str,
+        oauth_token_url: &str,
+    ) -> Result<AuthRecord, AuthError> {
+        let http_client = self
+            .http_client
+            .as_ref()
+            .map_err(|error| AuthError::Message(error.clone()))?;
+        let device = http_client
+            .post(device_code_url)
             .json(&serde_json::json!({ "client_id": CHATGPT_CLIENT_ID }))
             .send()
-            .await?
+            .await
+            .map_err(|error| auth_request_error("device-code request", error))?
             .error_for_status()?
             .json::<DeviceCodeResponse>()
             .await?;
@@ -178,14 +203,15 @@ impl PlatformAuthenticator {
                 ));
             }
 
-            let response = client
-                .post(CHATGPT_DEVICE_TOKEN_URL)
+            let response = http_client
+                .post(device_token_url)
                 .json(&serde_json::json!({
                     "device_auth_id": device.device_auth_id,
                     "user_code": device.user_code,
                 }))
                 .send()
-                .await?;
+                .await
+                .map_err(|error| auth_request_error("device-token polling", error))?;
 
             if response.status().is_success() {
                 let token_response = response.json::<DeviceTokenResponse>().await?;
@@ -216,15 +242,16 @@ impl PlatformAuthenticator {
             .extend_pairs(form)
             .finish();
 
-        let tokens = client
-            .post(CHATGPT_OAUTH_TOKEN_URL)
+        let tokens = http_client
+            .post(oauth_token_url)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
             )
             .body(body)
             .send()
-            .await?
+            .await
+            .map_err(|error| auth_request_error("token exchange", error))?
             .error_for_status()?
             .json::<OAuthTokenResponse>()
             .await?;
@@ -233,7 +260,19 @@ impl PlatformAuthenticator {
     }
 
     async fn refresh_tokens(&self, refresh_token: &str) -> Result<AuthRecord, RefreshTokensError> {
-        let client = reqwest::Client::new();
+        self.refresh_tokens_at(CHATGPT_OAUTH_TOKEN_URL, refresh_token)
+            .await
+    }
+
+    async fn refresh_tokens_at(
+        &self,
+        oauth_token_url: &str,
+        refresh_token: &str,
+    ) -> Result<AuthRecord, RefreshTokensError> {
+        let http_client = self
+            .http_client
+            .as_ref()
+            .map_err(|error| RefreshTokensError::Auth(AuthError::Message(error.clone())))?;
         let form = [
             ("client_id", CHATGPT_CLIENT_ID),
             ("grant_type", "refresh_token"),
@@ -245,8 +284,8 @@ impl PlatformAuthenticator {
             .extend_pairs(form)
             .finish();
 
-        let response = client
-            .post(CHATGPT_OAUTH_TOKEN_URL)
+        let response = http_client
+            .post(oauth_token_url)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
@@ -254,7 +293,7 @@ impl PlatformAuthenticator {
             .body(body)
             .send()
             .await
-            .map_err(AuthError::from)
+            .map_err(|error| auth_request_error("token refresh", error))
             .map_err(RefreshTokensError::Auth)?;
 
         let status = response.status();
@@ -282,6 +321,25 @@ impl PlatformAuthenticator {
             format_refresh_error(status, oauth_error.as_ref(), &body),
         )))
     }
+}
+
+fn default_oauth_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(DEFAULT_OAUTH_CONNECT_TIMEOUT)
+        .timeout(DEFAULT_OAUTH_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            format!("static ChatGPT OAuth HTTP client configuration must build: {error}")
+        })
+}
+
+fn auth_request_error(stage: &str, error: reqwest::Error) -> AuthError {
+    let retry = if error.is_timeout() {
+        " The authentication service did not respond before the configured network deadline. Check connectivity to auth.openai.com and try again."
+    } else {
+        " Check connectivity to auth.openai.com and try again."
+    };
+    AuthError::Message(format!("ChatGPT {stage} failed: {error}.{retry}"))
 }
 
 fn emit_device_code_prompt(handler: &DeviceCodeHandler, prompt: DeviceCodePrompt) {
@@ -432,7 +490,7 @@ where
 mod tests {
     use super::{
         DeviceCodeHandler, DeviceCodeResponse, OAuthErrorResponse, OAuthTokenResponse,
-        PlatformAuthenticator, build_auth_record, format_refresh_error,
+        PlatformAuthenticator, RefreshTokensError, build_auth_record, format_refresh_error,
         should_reauthenticate_after_refresh,
     };
     use reqwest::StatusCode;
@@ -491,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn noninteractive_oauth_requires_sign_in_instead_of_device_flow() {
-        let auth = PlatformAuthenticator::new(None, DeviceCodeHandler::default(), false);
+        let auth = PlatformAuthenticator::new(None, None, DeviceCodeHandler::default(), false);
         let err = auth
             .auth_context_oauth()
             .await
@@ -499,6 +557,74 @@ mod tests {
             .to_string();
 
         assert!(err.contains("ChatGPT sign-in required"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn device_code_request_obeys_injected_http_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole server");
+        let address = listener.local_addr().expect("blackhole address");
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept OAuth request");
+            std::future::pending::<()>().await;
+        });
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .timeout(std::time::Duration::from_millis(150))
+            .build()
+            .expect("bounded OAuth client");
+        let auth = PlatformAuthenticator::new(None, Some(http), DeviceCodeHandler::default(), true);
+        let endpoint = format!("http://{address}/device-code");
+        let started = std::time::Instant::now();
+
+        let error = auth
+            .login_device_flow_at(&endpoint, &endpoint, &endpoint)
+            .await
+            .expect_err("an unresponsive authentication service must time out")
+            .to_string();
+
+        server.abort();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "injected request deadline was not honored: {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("device-code request failed"), "{error}");
+        assert!(error.contains("configured network deadline"), "{error}");
+        assert!(error.contains("auth.openai.com"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn refresh_request_obeys_injected_deadline_without_exposing_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole server");
+        let address = listener.local_addr().expect("blackhole address");
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept OAuth request");
+            std::future::pending::<()>().await;
+        });
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(150))
+            .build()
+            .expect("bounded OAuth client");
+        let auth = PlatformAuthenticator::new(None, Some(http), DeviceCodeHandler::default(), true);
+        let endpoint = format!("http://{address}/token");
+        let refresh_token = "refresh-token-must-stay-secret";
+
+        let error = match auth.refresh_tokens_at(&endpoint, refresh_token).await {
+            Err(RefreshTokensError::Auth(error)) => error.to_string(),
+            Err(RefreshTokensError::Reauthenticate) => {
+                panic!("an unreachable provider is transient, not terminal auth rejection")
+            }
+            Ok(_) => panic!("an unresponsive authentication service must time out"),
+        };
+
+        server.abort();
+        assert!(error.contains("token refresh failed"), "{error}");
+        assert!(error.contains("configured network deadline"), "{error}");
+        assert!(!error.contains(refresh_token), "{error}");
     }
 
     #[test]

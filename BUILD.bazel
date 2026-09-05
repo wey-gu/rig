@@ -1,0 +1,7 @@
+exports_files(
+    [
+        "crates/rig-core/src/providers/chatgpt/auth/native.rs",
+        "crates/rig-core/src/providers/chatgpt/mod.rs",
+    ],
+    visibility = ["//visibility:public"],
+)

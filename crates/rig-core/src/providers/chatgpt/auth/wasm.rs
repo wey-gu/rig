@@ -9,6 +9,7 @@ pub(super) struct PlatformAuthenticator;
 impl PlatformAuthenticator {
     pub(super) fn new(
         _auth_file: Option<PathBuf>,
+        _oauth_http_client: Option<reqwest::Client>,
         _device_code_handler: DeviceCodeHandler,
         _allow_device_flow: bool,
     ) -> Self {
