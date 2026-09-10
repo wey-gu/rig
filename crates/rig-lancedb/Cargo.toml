@@ -12,16 +12,14 @@ workspace = true
 
 [dependencies]
 lancedb = { workspace = true }
-rig-core = { path = "../rig-core", version = "0.38.2", default-features = false }
+rig-core = { path = "../rig-core", version = "0.42.0", default-features = false }
 arrow-array = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 futures = { workspace = true }
 
-# https://github.com/jhpratt/deranged/issues/18
-deranged = { workspace = true }
-
 [dev-dependencies]
+rig-agent.workspace = true
 tokio = { workspace = true }
 anyhow = { workspace = true }
 httpmock = { workspace = true }

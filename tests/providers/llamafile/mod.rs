@@ -1,4 +1,5 @@
 mod agent;
+mod cassette_support;
 mod context;
 mod embeddings;
 mod extractor;
@@ -13,3 +14,13 @@ mod structured_output;
 mod support;
 mod tools;
 mod typed_prompt_tools;
+
+mod cassette {
+    mod agent;
+    mod embeddings;
+    mod raw_capture_matrix;
+    mod raw_stream_capture_matrix;
+    mod streaming;
+    mod streaming_tools;
+    mod tools;
+}

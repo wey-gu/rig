@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use rig::client::CompletionClient;
 use rig::completion::{Chat, Message};
+use rig::prelude::*;
 use rig::streaming::StreamingChat;
 
 use crate::copilot::{live_client, live_responses_model, with_copilot_cassette};
@@ -26,7 +26,7 @@ async fn streaming() {
 
     let stream = agent
         .stream_chat(reasoning::TOOL_USER_PROMPT, Vec::<Message>::new())
-        .multi_turn(3)
+        .max_turns(3)
         .await;
 
     let stats = reasoning::collect_stream_stats(stream, "copilot").await;
@@ -55,6 +55,7 @@ async fn nonstreaming() {
                 .additional_params(serde_json::json!({
                     "reasoning": { "effort": "high" }
                 }))
+                .default_max_turns(2)
                 .build();
 
             let result = agent

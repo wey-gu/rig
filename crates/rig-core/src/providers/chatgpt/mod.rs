@@ -18,21 +18,17 @@
 
 mod auth;
 
-use crate::OneOrMany;
-use crate::client::{
-    self, ApiKey, Capabilities, Capable, DebugExt, Nothing, Provider, ProviderBuilder,
-    ProviderClient, Transport,
-};
-use crate::completion::{self, CompletionError};
+use crate::client::{self, ApiKey, DebugExt, Provider, ProviderBuilder, ProviderClient, Transport};
+use crate::completion::{self, CompletionError, NormalizeCompletionResponse};
 use crate::http_client::{self, HttpClientExt};
 use crate::providers::openai::responses_api::{
     self, CompletionRequest as ResponsesRequest, Include,
 };
 use crate::streaming::StreamingCompletionResponse;
+use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
-use tracing::{Level, enabled, info_span};
 
 const CHATGPT_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_ORIGINATOR: &str = "rig";
@@ -162,16 +158,16 @@ impl Provider for ChatGPTExt {
     }
 }
 
-impl<H> Capabilities<H> for ChatGPTExt {
-    type Completion = Capable<ResponsesCompletionModel<H>>;
-    type Embeddings = Nothing;
-    type Transcription = Nothing;
-    type ModelListing = Nothing;
-    #[cfg(feature = "image")]
-    type ImageGeneration = Nothing;
-    #[cfg(feature = "audio")]
-    type AudioGeneration = Nothing;
+impl responses_api::ResponsesProviderExt for ChatGPTExt {
+    // The ChatGPT backend rejects the `system` role in `input`, so every
+    // system message — including mid-conversation ones — is lifted into the
+    // top-level `instructions` field.
+    fn system_instructions_placement(&self) -> responses_api::SystemInstructionsPlacement {
+        responses_api::SystemInstructionsPlacement::AllInstructions
+    }
 }
+
+client::impl_capabilities!(ChatGPTExt, completion = ResponsesCompletionModel<H>);
 
 impl DebugExt for ChatGPTExt {}
 
@@ -340,6 +336,7 @@ pub struct ResponsesCompletionModel<H = reqwest::Client> {
     client: Client<H>,
     pub model: String,
     pub tools: Vec<responses_api::ResponsesToolDefinition>,
+    pub strict_tools: bool,
 }
 
 impl<H> ResponsesCompletionModel<H>
@@ -352,7 +349,14 @@ where
             client,
             model: model.into(),
             tools: Vec::new(),
+            strict_tools: false,
         }
+    }
+
+    /// Enable strict mode for function tool schemas.
+    pub fn with_strict_tools(mut self) -> Self {
+        self.strict_tools = true;
+        self
     }
 
     pub fn with_tool(mut self, tool: impl Into<responses_api::ResponsesToolDefinition>) -> Self {
@@ -375,6 +379,7 @@ where
             self.model.clone(),
         );
         model.tools = self.tools.clone();
+        model.strict_tools = self.strict_tools;
         model
     }
 
@@ -383,17 +388,6 @@ where
         request: completion::CompletionRequest,
     ) -> Result<ResponsesRequest, CompletionError> {
         let mut request = self.openai_model().create_completion_request(request)?;
-
-        if let Some(system_instructions) =
-            normalize_system_messages_into_instructions(&mut request)?
-        {
-            request.instructions = Some(match request.instructions.as_deref() {
-                Some(existing) if !existing.trim().is_empty() => {
-                    format!("{system_instructions}\n\n{existing}")
-                }
-                _ => system_instructions,
-            });
-        }
 
         if let Some(default_instructions) = &self.client.ext().default_instructions {
             request.instructions = Some(merge_instructions(
@@ -439,7 +433,7 @@ where
                 http::header::AUTHORIZATION,
                 format!("Bearer {}", context.access_token),
             )
-            .header("session_id", nanoid::nanoid!());
+            .header("session_id", crate::id::generate());
 
         if let Some(account_id) = &context.account_id {
             req.header("ChatGPT-Account-Id", account_id)
@@ -448,11 +442,62 @@ where
         }
     }
 
-    async fn completion_from_sse(
+    /// Execute a ChatGPT completion and return the Responses API's own wire
+    /// response.
+    ///
+    /// This is the escape hatch for fields rig does not normalize, and it
+    /// issues the same single request the normalized path does.
+    ///
+    /// One caveat is specific to this provider: `/responses` answers with an
+    /// SSE body even for a non-streaming request, so the value returned here is
+    /// reassembled from the terminal `response.completed` event. That event
+    /// sometimes carries an empty `output`, in which case the assistant content
+    /// exists only in the preceding events and
+    /// [`completion::CompletionModel::completion`] rebuilds it from them. When
+    /// you need the provider's events in full fidelity rather than just its
+    /// terminal record, use [`ResponsesCompletionModel::raw_stream`].
+    pub async fn raw_completion(
+        &self,
+        completion_request: completion::CompletionRequest,
+    ) -> Result<responses_api::CompletionResponse, CompletionError> {
+        let record_telemetry_content = completion_request.record_telemetry_content;
+        let request = self.create_request(completion_request)?;
+        let span = self.completion_span(&request, record_telemetry_content);
+
+        tracing_futures::Instrument::instrument(
+            async move { Ok(self.send_completion(request).await?.0) },
+            span,
+        )
+        .await
+    }
+
+    /// Build the `chat` span for a non-streaming ChatGPT completion.
+    ///
+    /// The instructions recorded here are the ones actually sent: the request's
+    /// merged `instructions`, not the caller's preamble, which
+    /// `SystemInstructionsPlacement::AllInstructions` folds together with the
+    /// client's `default_instructions`.
+    fn completion_span(
+        &self,
+        request: &ResponsesRequest,
+        record_telemetry_content: bool,
+    ) -> tracing::Span {
+        CompletionSpanBuilder::new(PROVIDER_NAME, &request.model, CompletionOperation::Chat)
+            .system_instructions(request.instructions.as_deref(), record_telemetry_content)
+            .build()
+    }
+
+    /// Issue the request and return the reassembled wire response together with
+    /// the SSE body it came from.
+    ///
+    /// Both the raw and the normalized path go through here, so there is one
+    /// transport, one status check, and one parse — and the normalized path can
+    /// still reach the event stream for its empty-`output` fallback without
+    /// issuing a second request.
+    async fn send_completion(
         &self,
         request: ResponsesRequest,
-    ) -> Result<completion::CompletionResponse<responses_api::CompletionResponse>, CompletionError>
-    {
+    ) -> Result<(responses_api::CompletionResponse, String), CompletionError> {
         let body = serde_json::to_vec(&request)?;
         let auth = self
             .client
@@ -468,23 +513,51 @@ where
             .map_err(|err| CompletionError::HttpError(err.into()))?;
 
         let response = self.client.send(req).await?;
+        let status = response.status();
         let text = http_client::text(response).await?;
+        if !status.is_success() {
+            return Err(CompletionError::from_http_response(status, text));
+        }
+
+        // The `/responses` endpoint answers with an SSE body even for a
+        // non-streaming request, so the wire response is reassembled from the
+        // event stream rather than parsed as one JSON document.
         let raw_response = responses_api::streaming::parse_sse_completion_body(&text, "ChatGPT")?;
 
-        match raw_response.clone().try_into() {
-            Ok(response) => Ok(response),
-            // Some completed events omit items already delivered by the stream.
-            // Key recovery on the wire shape, not the normalizer's error wording.
+        let span = tracing::Span::current();
+        span.record_response_metadata(&raw_response);
+
+        Ok((raw_response, text))
+    }
+
+    /// Normalize a ChatGPT completion, falling back to the SSE event stream
+    /// when the reassembled response carries no output items.
+    ///
+    /// The captured `raw` is `raw_response` — what
+    /// [`ResponsesCompletionModel::raw_completion`] returns — on both
+    /// branches, so the empty-output fallback carries it too.
+    async fn normalized_completion(
+        &self,
+        request: ResponsesRequest,
+    ) -> Result<completion::CompletionResponse, CompletionError> {
+        let (raw_response, text) = self.send_completion(request).await?;
+        let captured = serde_json::to_value(&raw_response)?;
+
+        let response = match raw_response.clone().normalize(PROVIDER_NAME) {
+            Ok(response) => response,
+            // An empty `output` means the terminal event never carried the
+            // assembled items; rebuild the response from the raw event stream.
             Err(CompletionError::ResponseError(_)) if raw_response.output.is_empty() => {
                 responses_api::streaming::completion_response_from_sse_body(
+                    PROVIDER_NAME,
                     &text,
                     raw_response,
-                    "ChatGPT",
                 )
-                .await
+                .await?
             }
-            Err(error) => Err(error),
-        }
+            Err(error) => return Err(error),
+        };
+        Ok(response.with_raw(captured))
     }
 }
 
@@ -497,56 +570,34 @@ where
     }
 }
 
+impl<H> crate::client::ConstructCompletionModel<Client<H>> for ResponsesCompletionModel<H>
+where
+    Client<H>: HttpClientExt + Clone + Debug + 'static,
+    H: Clone + Default + Debug + WasmCompatSend + WasmCompatSync + 'static,
+{
+    fn construct(client: &Client<H>, model: String) -> Self {
+        Self::new(client.clone(), model)
+    }
+}
+
 impl<H> completion::CompletionModel for ResponsesCompletionModel<H>
 where
     Client<H>: HttpClientExt + Clone + Debug + 'static,
     H: Clone + Default + Debug + WasmCompatSend + WasmCompatSync + 'static,
 {
-    type Response = responses_api::CompletionResponse;
-    type StreamingResponse = responses_api::streaming::StreamingCompletionResponse;
-    type Client = Client<H>;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
-    }
-
     async fn completion(
         &self,
         completion_request: completion::CompletionRequest,
-    ) -> Result<completion::CompletionResponse<Self::Response>, CompletionError> {
+    ) -> Result<completion::CompletionResponse, CompletionError> {
+        let record_telemetry_content = completion_request.record_telemetry_content;
         let request = self.create_request(completion_request)?;
-
-        let span = if tracing::Span::current().is_disabled() {
-            info_span!(
-                target: "rig::completions",
-                "chat",
-                gen_ai.operation.name = "chat",
-                gen_ai.provider.name = "chatgpt",
-                gen_ai.request.model = self.model,
-                gen_ai.response.id = tracing::field::Empty,
-                gen_ai.response.model = tracing::field::Empty,
-                gen_ai.usage.output_tokens = tracing::field::Empty,
-                gen_ai.usage.input_tokens = tracing::field::Empty,
-                gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
-                gen_ai.input.messages = tracing::field::Empty,
-                gen_ai.output.messages = tracing::field::Empty,
-            )
-        } else {
-            tracing::Span::current()
-        };
+        let span = self.completion_span(&request, record_telemetry_content);
 
         tracing_futures::Instrument::instrument(
             async move {
-                let response = self.completion_from_sse(request).await?;
+                let response = self.normalized_completion(request).await?;
                 let span = tracing::Span::current();
-                span.record("gen_ai.response.id", &response.raw_response.id);
-                span.record("gen_ai.response.model", &response.raw_response.model);
-                span.record("gen_ai.usage.output_tokens", response.usage.output_tokens);
-                span.record("gen_ai.usage.input_tokens", response.usage.input_tokens);
-                span.record(
-                    "gen_ai.usage.cache_read.input_tokens",
-                    response.usage.cached_input_tokens,
-                );
+                span.record_token_usage(&response.usage);
                 Ok(response)
             },
             span,
@@ -557,7 +608,7 @@ where
     async fn stream(
         &self,
         completion_request: completion::CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+    ) -> Result<StreamingCompletionResponse, CompletionError> {
         Self::stream(self, completion_request).await
     }
 }
@@ -567,22 +618,38 @@ where
     Client<H>: HttpClientExt + Clone + Debug + 'static,
     H: Clone + Default + Debug + WasmCompatSend + WasmCompatSync + 'static,
 {
+    /// Open a stream normalized to rig's terminal record.
+    ///
+    /// Delegates to [`ResponsesCompletionModel::raw_stream`] — one request
+    /// either way.
     pub async fn stream(
         &self,
         completion_request: completion::CompletionRequest,
+    ) -> Result<StreamingCompletionResponse, CompletionError> {
+        let raw = self.raw_stream(completion_request).await?;
+
+        Ok(responses_api::streaming::normalize_responses_stream(
+            PROVIDER_NAME,
+            raw,
+        ))
+    }
+
+    /// Open a stream whose terminal record stays the Responses API's own type.
+    pub async fn raw_stream(
+        &self,
+        completion_request: completion::CompletionRequest,
     ) -> Result<
-        StreamingCompletionResponse<responses_api::streaming::StreamingCompletionResponse>,
+        crate::streaming::RawStreamingResult<responses_api::streaming::StreamingCompletionResponse>,
         CompletionError,
     > {
+        let record_telemetry_content = completion_request.record_telemetry_content;
         let request = self.create_request(completion_request)?;
 
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "ChatGPT Responses streaming completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "ChatGPT Responses streaming completion request",
+            &request,
+        );
 
         let body = serde_json::to_vec(&request)?;
         let auth = self
@@ -598,34 +665,27 @@ where
             .body(body)
             .map_err(|err| CompletionError::HttpError(err.into()))?;
 
-        let span = if tracing::Span::current().is_disabled() {
-            info_span!(
-                target: "rig::completions",
-                "chat_streaming",
-                gen_ai.operation.name = "chat_streaming",
-                gen_ai.provider.name = "chatgpt",
-                gen_ai.request.model = self.model,
-                gen_ai.response.id = tracing::field::Empty,
-                gen_ai.response.model = tracing::field::Empty,
-                gen_ai.usage.output_tokens = tracing::field::Empty,
-                gen_ai.usage.input_tokens = tracing::field::Empty,
-                gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
-            )
-        } else {
-            tracing::Span::current()
-        };
+        let span = CompletionSpanBuilder::new(
+            PROVIDER_NAME,
+            &request.model,
+            CompletionOperation::ChatStreaming,
+        )
+        .system_instructions(request.instructions.as_deref(), record_telemetry_content)
+        .build();
 
         let client = self.client.clone();
         let event_source = crate::http_client::sse::GenericEventSource::new(client, req)
             .allow_missing_content_type();
 
-        Ok(responses_api::streaming::stream_from_event_source(
+        Ok(responses_api::streaming::raw_stream_from_event_source(
             event_source,
             span,
-            "ChatGPT",
         ))
     }
 }
+
+/// Stable descriptor name reported on normalized ChatGPT responses.
+pub const PROVIDER_NAME: &str = "chatgpt";
 
 fn default_user_agent() -> String {
     format!(
@@ -641,49 +701,7 @@ fn default_auth_file() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("chatgpt").join("auth.json"))
 }
 
-fn config_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-    }
-}
-
-fn normalize_system_messages_into_instructions(
-    request: &mut ResponsesRequest,
-) -> Result<Option<String>, CompletionError> {
-    let mut system_instructions = Vec::new();
-    let mut filtered_items = Vec::new();
-
-    for item in request.input.clone() {
-        if let Some(system_text) = item.system_text() {
-            let system_text = system_text.trim();
-            if !system_text.is_empty() {
-                system_instructions.push(system_text.to_string());
-            }
-        } else {
-            filtered_items.push(item);
-        }
-    }
-
-    request.input = OneOrMany::many(filtered_items).map_err(|_| {
-        CompletionError::RequestError(
-            "ChatGPT responses request input must contain at least one non-system item".into(),
-        )
-    })?;
-
-    if system_instructions.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(system_instructions.join("\n\n")))
-    }
-}
+use crate::providers::internal::auth::config_dir;
 
 fn merge_instructions(default_instructions: &str, existing_instructions: Option<&str>) -> String {
     match existing_instructions
@@ -699,163 +717,6 @@ fn merge_instructions(default_instructions: &str, existing_instructions: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    async fn complete_sse_fixture(
-        events: Vec<serde_json::Value>,
-        status: &str,
-        output: serde_json::Value,
-    ) -> Result<completion::CompletionResponse<responses_api::CompletionResponse>, CompletionError>
-    {
-        use crate::{client::CompletionClient as _, completion::CompletionModel as _};
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-
-        let terminal = serde_json::json!({
-            "type": format!("response.{status}"),
-            "response": {
-                "id": "resp_fixture", "object": "response", "created_at": 1,
-                "status": status, "model": "gpt-5", "output": output,
-                "error": if status == "failed" {
-                    serde_json::json!({"code": "server_error", "message": "fixture failure"})
-                } else { serde_json::Value::Null },
-                "incomplete_details": if status == "incomplete" {
-                    serde_json::json!({"reason": "max_output_tokens"})
-                } else { serde_json::Value::Null },
-                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-                "tools": []
-            }
-        });
-        let body = events
-            .into_iter()
-            .chain([terminal])
-            .map(|event| format!("data: {event}\n\n"))
-            .collect::<String>();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = calls.clone();
-        let app = axum::Router::new().route(
-            "/responses",
-            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                let body = body.clone();
-                async move {
-                    assert_eq!(request["stream"], true);
-                    ([("content-type", "text/event-stream")], body)
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr().expect("address");
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let client = Client::builder()
-            .api_key("fixture-token")
-            .base_url(format!("http://{address}"))
-            .build()
-            .expect("client");
-        let result = client
-            .completion_model("gpt-5")
-            .completion_request("hello")
-            .send()
-            .await;
-        server.abort();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "recovery must reuse the same response"
-        );
-        result
-    }
-
-    #[tokio::test]
-    async fn completion_recovers_streamed_text_with_empty_terminal_output() {
-        let response = complete_sse_fixture(
-            vec![serde_json::json!({"type": "response.output_text.delta", "delta": "hello"})],
-            "completed",
-            serde_json::json!([]),
-        )
-        .await
-        .expect("streamed text must survive an empty terminal output");
-        let text: String = response
-            .choice
-            .iter()
-            .filter_map(|content| match content {
-                completion::AssistantContent::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "hello");
-        assert_eq!(response.usage.total_tokens, 5);
-    }
-
-    #[tokio::test]
-    async fn completion_recovers_streamed_tool_with_empty_terminal_output() {
-        let response = complete_sse_fixture(
-            vec![serde_json::json!({
-                "type": "response.output_item.done", "output_index": 0,
-                "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
-                    "name": "respond", "arguments": "{\"reply\":\"hello\"}", "status": "completed"}
-            })],
-            "completed",
-            serde_json::json!([]),
-        )
-        .await
-        .expect("streamed tool must survive an empty terminal output");
-        let calls: Vec<_> = response
-            .choice
-            .iter()
-            .filter_map(|content| match content {
-                completion::AssistantContent::ToolCall(call) => Some(call),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(calls.len(), 1);
-        let call = calls.first().expect("tool call");
-        assert_eq!(call.function.name, "respond");
-        assert_eq!(
-            call.function.arguments,
-            serde_json::json!({"reply": "hello"})
-        );
-        assert_eq!(response.usage.total_tokens, 5);
-    }
-
-    #[tokio::test]
-    async fn completion_preserves_terminal_text_without_duplicate_deltas() {
-        let response = complete_sse_fixture(
-            vec![serde_json::json!({"type": "response.output_text.delta", "delta": "hello"})],
-            "completed",
-            serde_json::json!([{
-                "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
-                "content": [{"type": "output_text", "text": "hello", "annotations": []}]
-            }]),
-        )
-        .await
-        .expect("terminal text");
-        assert_eq!(response.choice.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn completion_rejects_empty_and_unsuccessful_streams() {
-        assert!(
-            complete_sse_fixture(vec![], "completed", serde_json::json!([]))
-                .await
-                .is_err()
-        );
-        for status in ["failed", "incomplete"] {
-            let result = complete_sse_fixture(
-                vec![serde_json::json!({"type": "response.output_text.delta", "delta": "partial"})],
-                status,
-                serde_json::json!([]),
-            )
-            .await;
-            assert!(
-                result.is_err(),
-                "{status} must not recover partial output as success"
-            );
-        }
-    }
 
     #[test]
     fn test_parse_chatgpt_sse_completion() {
@@ -904,33 +765,86 @@ data: [DONE]"#;
         );
     }
 
+    fn chatgpt_conversion_request(chat_history: Vec<completion::Message>) -> ResponsesRequest {
+        let client = crate::providers::chatgpt::Client::builder()
+            .oauth()
+            .build()
+            .expect("client");
+        let model = ResponsesCompletionModel::new(client, GPT_5_3_CODEX);
+
+        model
+            .openai_model()
+            .create_completion_request(completion::CompletionRequest {
+                model: Some("gpt-5.4".to_string()),
+                preamble: Some("System one".to_string()),
+                chat_history,
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            })
+            .expect("request")
+    }
+
     #[test]
-    fn test_normalize_system_messages_into_instructions() {
-        let completion_request = completion::CompletionRequest {
-            model: Some("gpt-5.4".to_string()),
-            preamble: Some("System one".to_string()),
-            chat_history: OneOrMany::many(vec![
-                completion::Message::system("System two"),
-                completion::Message::user("hi"),
-            ])
-            .expect("history"),
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: None,
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-        };
-        let mut request = ResponsesRequest::try_from(("gpt-5.4".to_string(), completion_request))
+    fn test_conversion_lifts_leading_system_messages_into_instructions() {
+        let request = chatgpt_conversion_request(vec![
+            completion::Message::system("System two"),
+            completion::Message::user("hi"),
+        ]);
+
+        assert_eq!(
+            request.instructions.as_deref(),
+            Some("System one\n\nSystem two")
+        );
+        assert_eq!(request.input.len(), 1);
+    }
+
+    #[test]
+    fn test_conversion_lifts_mid_conversation_system_messages() {
+        let request = chatgpt_conversion_request(vec![
+            completion::Message::user("hi"),
+            completion::Message::system("Mid-conversation instruction"),
+            completion::Message::user("again"),
+        ]);
+
+        assert_eq!(
+            request.instructions.as_deref(),
+            Some("System one\n\nMid-conversation instruction")
+        );
+        assert_eq!(request.input.len(), 2);
+    }
+
+    #[test]
+    fn test_create_request_merges_default_and_request_instructions() {
+        let client = crate::providers::chatgpt::Client::builder()
+            .oauth()
+            .build()
+            .expect("client");
+        let model = ResponsesCompletionModel::new(client, GPT_5_3_CODEX);
+
+        let request = model
+            .create_request(completion::CompletionRequest {
+                record_telemetry_content: false,
+                model: None,
+                preamble: Some("Respond tersely.".to_string()),
+                chat_history: vec![completion::Message::user("hello")],
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+            })
             .expect("request");
 
-        let instructions = normalize_system_messages_into_instructions(&mut request)
-            .expect("normalize")
-            .expect("instructions");
-
-        assert_eq!(instructions, "System one\n\nSystem two");
-        assert_eq!(request.input.len(), 1);
+        let expected = format!("{DEFAULT_INSTRUCTIONS}\n\nRespond tersely.");
+        assert_eq!(request.instructions.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
@@ -945,7 +859,7 @@ data: [DONE]"#;
             .create_request(completion::CompletionRequest {
                 model: None,
                 preamble: None,
-                chat_history: OneOrMany::one(completion::Message::user("hello")),
+                chat_history: vec![completion::Message::user("hello")],
                 documents: Vec::new(),
                 tools: Vec::new(),
                 temperature: Some(0.5),
@@ -953,6 +867,7 @@ data: [DONE]"#;
                 tool_choice: None,
                 additional_params: None,
                 output_schema: None,
+                record_telemetry_content: false,
             })
             .expect("request");
 
@@ -968,9 +883,9 @@ data: [DONE]"#;
         let raw_response = responses_api::streaming::parse_sse_completion_body(body, "ChatGPT")
             .expect("expected response");
         let response = responses_api::streaming::completion_response_from_sse_body(
+            PROVIDER_NAME,
             body,
             raw_response,
-            "ChatGPT",
         )
         .await
         .expect("fallback response");
@@ -986,5 +901,147 @@ data: [DONE]"#;
 
         assert_eq!(text, "hi");
         assert_eq!(response.usage.total_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn completion_http_non_success_preserves_status_and_body() {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel;
+        use crate::test_utils::RecordingHttpClient;
+
+        let cases = [
+            (
+                http::StatusCode::UNAUTHORIZED,
+                r#"{"error":{"message":"expired access token","type":"invalid_request_error"}}"#,
+                "expired access token",
+            ),
+            (
+                http::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+                "rate limited",
+            ),
+        ];
+
+        for (status, body, message) in cases {
+            let http_client = RecordingHttpClient::with_error_response(status, body);
+            let client = crate::providers::chatgpt::Client::builder()
+                .api_key(ChatGPTAuth::AccessToken {
+                    access_token: "test-token".to_string(),
+                    account_id: Some("account-id".to_string()),
+                })
+                .http_client(http_client)
+                .build()
+                .expect("client should build");
+            let model = client.completion_model(GPT_5_4);
+            let request = model.completion_request("hello").build();
+
+            let error = model
+                .completion(request)
+                .await
+                .expect_err("completion should fail with non-success status");
+
+            assert!(matches!(&error, CompletionError::HttpError(_)));
+            assert_eq!(error.provider_response_status(), Some(status));
+            assert_eq!(error.provider_response_body(), Some(body));
+            assert!(
+                error.to_string().contains(message),
+                "error should include provider body: {error}"
+            );
+        }
+    }
+
+    /// Raw-capture tests for the ChatGPT model — the `other` seam shape: the
+    /// `/responses` endpoint answers a non-streaming call with an SSE body, so
+    /// `raw_completion` is a wire response *reassembled* from the event
+    /// stream, and the normalized path has an empty-`output` fallback that
+    /// rebuilds the choice from that same stream. The capture must be the
+    /// reassembled `responses_api::CompletionResponse` on both branches.
+    /// Driven end to end over the recording mock transport with an access
+    /// token, the same way the error-path tests above reach `completion()`.
+    mod raw_capture {
+        use super::*;
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::test_utils::RecordingHttpClient;
+
+        /// A complete turn: the terminal `response.completed` carries the
+        /// assembled output plus `service_tier`, which the normalized
+        /// response provably lacks.
+        const SSE_BODY: &str = r#"data: {"type":"response.output_text.delta","delta":"hi"}
+data: {"type":"response.completed","response":{"id":"resp_chatgpt_raw","object":"response","created_at":1,"status":"completed","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt-5.4","service_tier":"default","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"output":[{"type":"message","id":"msg_chatgpt_raw","status":"completed","role":"assistant","content":[{"type":"output_text","annotations":[],"text":"hi"}]}],"tools":[]}}
+data: [DONE]"#;
+
+        /// The same turn with an empty terminal `output`: the normalized path
+        /// takes the streamed-text fallback.
+        const EMPTY_OUTPUT_SSE_BODY: &str = r#"data: {"type":"response.output_text.delta","delta":"hi"}
+data: {"type":"response.completed","response":{"id":"resp_chatgpt_raw","object":"response","created_at":1,"status":"completed","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt-5.4","service_tier":"default","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"output":[],"tools":[]}}
+data: [DONE]"#;
+
+        fn model(body: &'static str) -> ResponsesCompletionModel<RecordingHttpClient> {
+            let client = crate::providers::chatgpt::Client::builder()
+                .api_key(ChatGPTAuth::AccessToken {
+                    access_token: "test-token".to_string(),
+                    account_id: Some("account-id".to_string()),
+                })
+                .http_client(RecordingHttpClient::new(body))
+                .build()
+                .expect("client should build");
+            client.completion_model(GPT_5_4)
+        }
+
+        /// The load-bearing capture property, on both normalization branches:
+        /// `raw` is the reassembled Responses `CompletionResponse` — it
+        /// deserializes back into that type and re-serializes to the identical
+        /// value, and equals what `raw_completion` returns for the same body.
+        /// On the empty-`output` body the choice comes from the streamed text,
+        /// and the capture is still the terminal record (with its empty
+        /// `output`), because that is what `raw_completion` would have
+        /// returned.
+        #[tokio::test]
+        async fn completion_captures_raw_on_both_normalization_branches() {
+            for (body, case) in [
+                (SSE_BODY, "assembled output"),
+                (EMPTY_OUTPUT_SSE_BODY, "empty-output fallback"),
+            ] {
+                let model = model(body);
+
+                let response = model
+                    .completion(model.completion_request("hello").build())
+                    .await
+                    .expect("completion");
+                let escape_hatch = model
+                    .raw_completion(model.completion_request("hello").build())
+                    .await
+                    .expect("raw completion");
+
+                let raw = &response.raw;
+                let typed: responses_api::CompletionResponse =
+                    serde_json::from_value(raw.clone()).expect("raw must deserialize");
+                assert_eq!(
+                    serde_json::to_value(&typed).expect("re-serialize"),
+                    *raw,
+                    "{case}: the capture must be exactly what the wire type serializes to"
+                );
+                assert_eq!(
+                    serde_json::to_value(&escape_hatch).expect("serialize raw_completion"),
+                    *raw,
+                    "{case}: the capture must be what raw_completion returns"
+                );
+                assert_eq!(raw["service_tier"], "default", "{case}");
+                assert_eq!(typed.id, "resp_chatgpt_raw", "{case}");
+
+                assert_eq!(response.usage.total_tokens, 2, "{case}");
+                assert_eq!(
+                    response.choice,
+                    vec![completion::AssistantContent::text("hi")],
+                    "{case}: both branches yield the streamed text"
+                );
+                assert_eq!(
+                    response.identity().response_id.as_deref(),
+                    Some("resp_chatgpt_raw"),
+                    "{case}"
+                );
+            }
+        }
     }
 }

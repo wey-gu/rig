@@ -7,7 +7,7 @@ when:
     value: text/event-stream
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"Be precise and concise.","type":"text"}],"role":"system"},{"content":"When and where and what type is the next solar eclipse?","role":"user"}],"model":"openai/gpt-4o-mini","stream":true,"temperature":0.5}'
+  body: '{"messages":[{"content":"Be precise and concise.","role":"system"},{"content":"When and where and what type is the next solar eclipse?","role":"user"}],"model":"openai/gpt-4o-mini","stream":true,"temperature":0.5}'
 then:
   status: 200
   header:

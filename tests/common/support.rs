@@ -4,14 +4,16 @@
 use futures::StreamExt;
 use rig::{
     agent::{MultiTurnStreamItem, StreamingError, StreamingResult},
-    completion::{AssistantContent, GetTokenUsage, ToolDefinition},
+    completion::{AssistantContent, ToolDefinition},
     embeddings::Embedding,
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingCompletionResponse},
+    tool::PortableTool,
     tool::Tool,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 pub(crate) const BASIC_PREAMBLE: &str = "You are a concise assistant. Answer directly.";
 pub(crate) const BASIC_PROMPT: &str = "In one or two sentences, explain what Rust programming language is and why memory safety matters.";
@@ -83,6 +85,8 @@ pub(crate) const IMAGE_FIXTURE_PATH: &str = concat!(
 );
 pub(crate) const PDF_FIXTURE_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/pages.pdf");
+pub(crate) const VIDEO_FIXTURE_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/sample_video.mp4");
 
 pub(crate) const EMBEDDING_INPUTS: [&str; 3] = [
     "Rust values memory safety and predictable performance.",
@@ -95,6 +99,30 @@ pub(crate) struct SmokeStructuredOutput {
     pub(crate) title: String,
     pub(crate) category: String,
     pub(crate) summary: String,
+}
+
+pub(crate) fn smoke_structured_output_value() -> serde_json::Value {
+    json!({
+        "title": "Seattle Rust Meetup",
+        "category": "Technology",
+        "summary": "A focused local meetup for Rust developers."
+    })
+}
+
+pub(crate) fn ecs_synthetic_output_tool_name<T>() -> String
+where
+    T: JsonSchema,
+{
+    let schema = schemars::schema_for!(T);
+    let mut hasher = Sha256::new();
+    hasher.update(schema.as_value().to_string().as_bytes());
+    let prefix = hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("__rig_output_{prefix}")
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -129,18 +157,22 @@ impl Tool for Adder {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: serde_json::from_str(
-                r#"{"type":"object","properties":{"x":{"type":"number","description":"The first number to add"},"y":{"type":"number","description":"The second number to add"}},"required":["x","y"]}"#,
-            )
-            .expect("adder schema should deserialize"),
-        }
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::from_str(
+                r#"{"type":"object","properties":{"x":{"type":"number","description":"The first number to add"},"y":{"type":"number","description":"The second number to add"}},"required":["x","y"]}"#,
+            )
+            .expect("adder schema should deserialize")
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         Ok(args.x + args.y)
     }
 }
@@ -154,15 +186,77 @@ impl Tool for Subtract {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "subtract".to_string(),
-            description: "Subtract y from x (i.e.: x - y)".to_string(),
-            parameters: serde_json::from_str(
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::from_str(
                 r#"{"type":"object","properties":{"x":{"type":"number","description":"The number to subtract from"},"y":{"type":"number","description":"The number to subtract"}},"required":["x","y"]}"#,
             )
-            .expect("subtract schema should deserialize"),
-        }
+            .expect("subtract schema should deserialize")
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(args.x - args.y)
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+pub(crate) struct PortableAdder;
+
+impl PortableTool for PortableAdder {
+    const NAME: &'static str = "add";
+    type Error = MathError;
+    type Args = OperationArgs;
+    type Output = i32;
+
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {"type": "number", "description": "The first number to add"},
+                "y": {"type": "number", "description": "The second number to add"}
+            },
+            "required": ["x", "y"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        Ok(args.x + args.y)
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+pub(crate) struct PortableSubtract;
+
+impl PortableTool for PortableSubtract {
+    const NAME: &'static str = "subtract";
+    type Error = MathError;
+    type Args = OperationArgs;
+    type Output = i32;
+
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {"type": "number", "description": "The number to subtract from"},
+                "y": {"type": "number", "description": "The number to subtract"}
+            },
+            "required": ["x", "y"]
+        })
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -179,19 +273,23 @@ impl Tool for AlphaSignal {
     type Args = EmptyArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Return the alpha signal marker.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Return the alpha signal marker.".to_string()
     }
 
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        _args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         Ok(ALPHA_SIGNAL_OUTPUT.to_string())
     }
 }
@@ -205,19 +303,23 @@ impl Tool for BetaSignal {
     type Args = EmptyArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Return the beta signal marker.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Return the beta signal marker.".to_string()
     }
 
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        _args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         Ok(BETA_SIGNAL_OUTPUT.to_string())
     }
 }
@@ -243,7 +345,7 @@ pub(crate) fn assert_nonempty_response(response: &str) {
     );
 }
 
-pub(crate) fn assistant_text_response(choice: &rig::OneOrMany<AssistantContent>) -> Option<String> {
+pub(crate) fn assistant_text_response(choice: &[AssistantContent]) -> Option<String> {
     let response = choice
         .iter()
         .filter_map(|content| match content {
@@ -375,27 +477,186 @@ pub(crate) fn assert_embeddings_nonempty_and_consistent(
     }
 }
 
-pub(crate) async fn collect_stream_final_response<R>(
-    stream: &mut StreamingResult<R>,
+// ---------------------------------------------------------------------------
+// Model-turn termination metadata (rig#2184).
+//
+// One implementation, driven by every provider suite that covers the feature.
+// That is the portability claim as code: if a provider needed its own probe,
+// the metadata would not be provider-neutral.
+// ---------------------------------------------------------------------------
+
+/// One turn's termination as a hook sees it: why it stopped, and the effective
+/// output-token cap that attempt ran under.
+pub(crate) type ObservedTermination = (Option<rig::completion::FinishReason>, Option<u64>);
+
+/// Records `ModelTurnFinished`'s normalized termination metadata for every
+/// accepted turn, naming no provider and touching no raw response type.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TurnTerminationProbe {
+    observations: std::sync::Arc<std::sync::Mutex<Vec<ObservedTermination>>>,
+}
+
+impl TurnTerminationProbe {
+    pub(crate) fn observations(&self) -> Vec<ObservedTermination> {
+        self.observations.lock().expect("observations").clone()
+    }
+
+    /// The reason reported for the first accepted turn.
+    pub(crate) fn first_reason(&self) -> Option<rig::completion::FinishReason> {
+        self.observations()
+            .first()
+            .and_then(|(reason, _)| reason.clone())
+    }
+
+    /// The effective cap reported for the first accepted turn.
+    pub(crate) fn first_max_tokens(&self) -> Option<u64> {
+        self.observations().first().and_then(|(_, cap)| *cap)
+    }
+}
+
+impl rig::agent::AgentHook for TurnTerminationProbe {
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::ModelTurnFinished<'_>,
+    ) -> rig::agent::ModelTurnAction {
+        self.observations
+            .lock()
+            .expect("observations")
+            .push((event.finish_reason.cloned(), event.max_tokens));
+        rig::agent::ModelTurnAction::continue_run()
+    }
+}
+
+/// Raises the output-token cap whenever the provider cut a turn short, then
+/// retries it — the policy rig#2184 exists to make portable. It reads only
+/// `FinishReason` and the reported cap, so the same instance drives every
+/// provider.
+///
+/// Register this *before* any hook that may return a non-continue action:
+/// such an action short-circuits the hooks behind it.
+#[derive(Clone, Debug)]
+pub(crate) struct EscalateCapOnTruncation {
+    cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    escalated_to: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    grown_cap: u64,
+    max_retries: u32,
+    retries: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl EscalateCapOnTruncation {
+    /// Start every attempt at `start_cap`; on a truncated, tool-free turn,
+    /// re-run it once at `grown_cap`.
+    pub(crate) fn new(start_cap: u64, grown_cap: u64) -> Self {
+        Self {
+            cap: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start_cap)),
+            escalated_to: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            grown_cap,
+            max_retries: 1,
+            retries: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    /// The caps this hook asked for, in order — one entry per escalation.
+    pub(crate) fn escalations(&self) -> Vec<u64> {
+        self.escalated_to.lock().expect("escalated_to").clone()
+    }
+
+    pub(crate) fn retries(&self) -> u32 {
+        self.retries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl rig::agent::AgentHook for EscalateCapOnTruncation {
+    /// Every attempt is prepared afresh, so the current cap is applied here and
+    /// reported back on that attempt's `ModelTurnFinished`.
+    async fn on_completion_call(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        _event: rig::agent::CompletionCallEvent<'_>,
+    ) -> rig::agent::CompletionCallAction {
+        rig::agent::CompletionCallAction::patch(
+            rig::agent::RequestPatch::new()
+                .max_tokens(self.cap.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::ModelTurnFinished<'_>,
+    ) -> rig::agent::ModelTurnAction {
+        let truncated = event
+            .finish_reason
+            .is_some_and(rig::completion::FinishReason::truncated_output);
+        // Retrying a turn carrying tool calls is rejected, so a policy that may
+        // meet one has to check before asking.
+        let has_tool_call = event
+            .content
+            .iter()
+            .any(|content| matches!(content, AssistantContent::ToolCall(_)));
+
+        if truncated
+            && !has_tool_call
+            && self.retries.load(std::sync::atomic::Ordering::SeqCst) < self.max_retries
+        {
+            self.retries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cap
+                .store(self.grown_cap, std::sync::atomic::Ordering::SeqCst);
+            self.escalated_to
+                .lock()
+                .expect("escalated_to")
+                .push(self.grown_cap);
+            return rig::agent::ModelTurnAction::repeat();
+        }
+        rig::agent::ModelTurnAction::continue_run()
+    }
+}
+
+pub(crate) async fn collect_stream_final_response(
+    stream: &mut StreamingResult,
 ) -> Result<String, StreamingError> {
     let mut final_response = None;
 
     while let Some(item) = stream.next().await {
         if let MultiTurnStreamItem::FinalResponse(response) = item? {
-            final_response = Some(response.response().to_owned());
+            final_response = Some(response.output().to_owned());
         }
     }
 
     Ok(final_response.expect("stream should yield a final response"))
 }
 
-pub(crate) async fn assert_stream_contains_zero_arg_tool_call_named<R>(
-    mut stream: StreamingCompletionResponse<R>,
+pub(crate) async fn collect_stream_final_response_and_provider_final(
+    stream: &mut StreamingResult,
+) -> Result<(String, rig::streaming::StreamFinal), StreamingError> {
+    let mut final_response = None;
+    let mut provider_final = None;
+
+    while let Some(item) = stream.next().await {
+        match item? {
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Final(final_)) => {
+                provider_final = Some(final_);
+            }
+            MultiTurnStreamItem::FinalResponse(response) => {
+                final_response = Some(response.output().to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        final_response.expect("stream should yield a final response"),
+        provider_final.expect("stream should yield a typed provider final"),
+    ))
+}
+
+pub(crate) async fn assert_stream_contains_zero_arg_tool_call_named(
+    mut stream: StreamingCompletionResponse,
     expected_name: &str,
     expect_final_response: bool,
-) where
-    R: Clone + Unpin + GetTokenUsage,
-{
+) {
     let mut saw_final = false;
     let mut saw_matching_tool_call = false;
 
@@ -478,9 +739,7 @@ impl RawStreamObservation {
     }
 }
 
-pub(crate) async fn collect_stream_observation<R>(
-    stream: &mut StreamingResult<R>,
-) -> StreamObservation {
+pub(crate) async fn collect_stream_observation(stream: &mut StreamingResult) -> StreamObservation {
     let mut observation = StreamObservation::new();
 
     while let Some(item) = stream.next().await {
@@ -503,7 +762,7 @@ pub(crate) async fn collect_stream_observation<R>(
                 StreamedAssistantContent::ToolCallDelta { .. } => {
                     observation.events.push("tool_call_delta");
                 }
-                StreamedAssistantContent::Reasoning(_) => {
+                StreamedAssistantContent::Reasoning { .. } => {
                     observation.events.push("reasoning");
                 }
                 StreamedAssistantContent::ReasoningDelta { .. } => {
@@ -512,6 +771,9 @@ pub(crate) async fn collect_stream_observation<R>(
                 StreamedAssistantContent::Final(_) => {
                     observation.events.push("stream_final");
                 }
+                StreamedAssistantContent::Unknown(_) => {
+                    observation.events.push("unknown");
+                }
             },
             Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult { .. })) => {
                 observation.tool_results += 1;
@@ -519,7 +781,7 @@ pub(crate) async fn collect_stream_observation<R>(
                 observation.events.push("tool_result");
             }
             Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                observation.final_response_text = Some(response.response().to_owned());
+                observation.final_response_text = Some(response.output().to_owned());
                 observation.got_final_response = true;
                 observation.events.push("final_response");
             }
@@ -534,11 +796,32 @@ pub(crate) async fn collect_stream_observation<R>(
     observation
 }
 
-pub(crate) async fn collect_raw_stream_observation<R>(
-    mut stream: StreamingCompletionResponse<R>,
+/// Drive a raw provider stream to exhaustion, keeping both the visible text
+/// and the terminal record.
+///
+/// The observation helpers above drop the terminal record; matrices that are
+/// about what the terminal *carries* (a finish reason, usage) need it.
+pub(crate) async fn collect_text_and_terminal(
+    mut stream: StreamingCompletionResponse,
+) -> (String, Option<rig::streaming::StreamFinal>) {
+    let mut text = String::new();
+    let mut terminal = None;
+
+    while let Some(item) = stream.next().await {
+        match item.expect("stream item should not be an error") {
+            StreamedAssistantContent::Text(chunk) => text.push_str(&chunk.text),
+            StreamedAssistantContent::Final(final_record) => terminal = Some(final_record),
+            _ => {}
+        }
+    }
+
+    (text, terminal)
+}
+
+pub(crate) async fn collect_raw_stream_observation(
+    mut stream: StreamingCompletionResponse,
 ) -> RawStreamObservation
 where
-    R: Clone + Unpin + GetTokenUsage,
 {
     let mut observation = RawStreamObservation::new();
 
@@ -560,7 +843,7 @@ where
             Ok(StreamedAssistantContent::ToolCallDelta { .. }) => {
                 observation.events.push("tool_call_delta");
             }
-            Ok(StreamedAssistantContent::Reasoning(_)) => {
+            Ok(StreamedAssistantContent::Reasoning { .. }) => {
                 observation.events.push("reasoning");
             }
             Ok(StreamedAssistantContent::ReasoningDelta { .. }) => {
@@ -569,6 +852,9 @@ where
             Ok(StreamedAssistantContent::Final(_)) => {
                 observation.got_final = true;
                 observation.events.push("final");
+            }
+            Ok(StreamedAssistantContent::Unknown(_)) => {
+                observation.events.push("unknown");
             }
             Err(error) => {
                 observation.errors.push(error.to_string());
@@ -621,7 +907,7 @@ pub(crate) fn assert_two_tool_roundtrip_contract(
     assert_eq!(
         observation.final_response_text.as_deref(),
         Some(observation.final_turn_text.as_str()),
-        "FinalResponse.response() should match the final turn's streamed text"
+        "FinalResponse.output() should match the final turn's streamed text"
     );
     assert!(
         observation.tool_results >= expected_tools.len(),
@@ -705,7 +991,7 @@ pub(crate) fn assert_tool_call_precedes_later_text(
     assert_eq!(
         observation.final_response_text.as_deref(),
         Some(observation.final_turn_text.as_str()),
-        "FinalResponse.response() should match the final turn's streamed text"
+        "FinalResponse.output() should match the final turn's streamed text"
     );
     assert!(
         observation
@@ -859,6 +1145,45 @@ pub(crate) fn assert_raw_stream_contains_distinct_tool_calls_before_text(
     }
 }
 
+/// Every tool call surfaced on the raw stream must carry a JSON **object** as
+/// its `function.arguments` (never a bare string), the invariant fixed in #1958:
+/// a downstream object-typed serializer (e.g. Anthropic's `tool_use.input`)
+/// rejects a string input. This guards the streaming aggregator end-to-end on
+/// real provider traffic, complementing the in-crate eviction unit tests.
+pub(crate) fn assert_raw_stream_tool_call_arguments_are_objects(
+    observation: &RawStreamObservation,
+    expected_tools: &[&str],
+) {
+    assert!(
+        observation.errors.is_empty(),
+        "raw stream should not emit errors: {:?}",
+        observation.errors
+    );
+    assert!(
+        observation.got_final,
+        "raw stream should emit a final response"
+    );
+    assert!(
+        observation.tool_calls.len() >= expected_tools.len(),
+        "expected at least {} raw stream tool calls, saw {:?}",
+        expected_tools.len(),
+        observation
+            .tool_calls
+            .iter()
+            .map(|tool_call| tool_call.function.name.clone())
+            .collect::<Vec<_>>(),
+    );
+
+    for tool_call in &observation.tool_calls {
+        assert!(
+            tool_call.function.arguments.is_object(),
+            "tool call `{}` must surface object arguments, got {:?}",
+            tool_call.function.name,
+            tool_call.function.arguments,
+        );
+    }
+}
+
 pub(crate) fn assert_raw_stream_text_contains(
     observation: &RawStreamObservation,
     expected: &[&str],
@@ -890,4 +1215,79 @@ pub(crate) fn assert_smoke_structured_output(output: &SmokeStructuredOutput) {
     assert_nonempty_response(&output.title);
     assert_nonempty_response(&output.category);
     assert_nonempty_response(&output.summary);
+}
+
+/// Shared identity-observing hook for the rig#2265 response-identity
+/// cassettes: captures each event's [`rig::completion::ResponseIdentity`]
+/// so provider suites can assert per-attempt identity on every observer
+/// surface.
+#[derive(Clone, Default)]
+pub(crate) struct IdentityProbe {
+    pub(crate) blocking: std::sync::Arc<std::sync::Mutex<Vec<rig::completion::ResponseIdentity>>>,
+    pub(crate) stream_finishes:
+        std::sync::Arc<std::sync::Mutex<Vec<rig::completion::ResponseIdentity>>>,
+    pub(crate) turns: std::sync::Arc<std::sync::Mutex<Vec<rig::completion::ResponseIdentity>>>,
+}
+
+impl IdentityProbe {
+    pub(crate) fn turn_identities(&self) -> Vec<rig::completion::ResponseIdentity> {
+        self.turns.lock().expect("turn identities").clone()
+    }
+
+    pub(crate) fn blocking_identities(&self) -> Vec<rig::completion::ResponseIdentity> {
+        self.blocking.lock().expect("blocking identities").clone()
+    }
+
+    pub(crate) fn stream_finish_identities(&self) -> Vec<rig::completion::ResponseIdentity> {
+        self.stream_finishes
+            .lock()
+            .expect("stream finish identities")
+            .clone()
+    }
+}
+
+impl rig::agent::AgentHook for IdentityProbe {
+    async fn on_completion_response(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::CompletionResponseEvent<'_>,
+    ) -> rig::agent::ObservationAction {
+        self.blocking
+            .lock()
+            .expect("blocking identities")
+            .push(event.identity.clone());
+        rig::agent::ObservationAction::continue_run()
+    }
+
+    async fn on_stream_response_finish(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::StreamResponseFinish<'_>,
+    ) -> rig::agent::ObservationAction {
+        self.stream_finishes
+            .lock()
+            .expect("stream finish identities")
+            .push(event.identity.clone());
+        rig::agent::ObservationAction::continue_run()
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::ModelTurnFinished<'_>,
+    ) -> rig::agent::ModelTurnAction {
+        self.turns
+            .lock()
+            .expect("turn identities")
+            .push(event.identity.clone());
+        rig::agent::ModelTurnAction::continue_run()
+    }
+}
+
+/// Assert a transport request id is populated and non-empty.
+pub(crate) fn assert_transport_request_id(id: Option<&str>, context: &str) {
+    assert!(
+        id.is_some_and(|id| !id.trim().is_empty()),
+        "{context}: provider_request_id must be populated"
+    );
 }

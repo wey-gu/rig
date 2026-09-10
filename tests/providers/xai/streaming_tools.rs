@@ -1,10 +1,8 @@
 //! xAI streaming tools smoke test.
-
-use rig::OneOrMany;
-use rig::client::CompletionClient;
-use rig::completion::{CompletionModel, ToolDefinition};
+use rig::completion::CompletionModel;
 use rig::message::ToolChoice;
-use rig::message::{AssistantContent, Message};
+use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
+use rig::prelude::*;
 use rig::providers::xai;
 use rig::streaming::StreamingPrompt;
 use rig::tool::Tool;
@@ -42,19 +40,23 @@ impl Tool for StatusWordTool {
     type Args = NoArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Return a harmless status word.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-            }),
-        }
+    fn description(&self) -> String {
+        "Return a harmless status word.".to_string()
     }
 
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        _args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         Ok(XAI_STATUS_TOOL_OUTPUT.to_string())
     }
 }
@@ -91,7 +93,7 @@ async fn responses_stream_preserves_tool_result_flow() {
 
             let mut stream = agent
                 .stream_prompt(XAI_STATUS_TOOL_PROMPT)
-                .multi_turn(5)
+                .max_turns(5)
                 .await;
             let observation = collect_stream_observation(&mut stream).await;
 
@@ -114,7 +116,7 @@ async fn raw_responses_stream_preserves_tool_then_followup_text_ordering() {
             let request = model
                 .completion_request(XAI_STATUS_TOOL_PROMPT)
                 .preamble(XAI_STATUS_TOOL_PREAMBLE.to_string())
-                .tool(StatusWordTool.definition(String::new()).await)
+                .tool(rig::tool::tool_definition(&StatusWordTool))
                 .build();
 
             let first_turn = collect_raw_stream_observation(
@@ -135,13 +137,16 @@ async fn raw_responses_stream_preserves_tool_then_followup_text_ordering() {
                 .expect("raw xAI responses stream should yield get_status_word");
             let assistant_message = Message::Assistant {
                 id: None,
-                content: OneOrMany::one(AssistantContent::ToolCall(tool_call.clone())),
+                content: vec![AssistantContent::ToolCall(tool_call.clone())],
             };
-            let tool_result_message = Message::tool_result_with_call_id(
-                tool_call.id,
-                tool_call.call_id,
-                XAI_STATUS_TOOL_OUTPUT,
-            );
+            let tool_result_message = Message::User {
+                content: vec![UserContent::tool_result_for(
+                    tool_call.id.clone(),
+                    tool_call.provider.clone(),
+                    tool_call.function.name.clone(),
+                    vec![ToolResultContent::text(XAI_STATUS_TOOL_OUTPUT)],
+                )],
+            };
             let followup_request = model
                 .completion_request(
                     "Now reply in one short sentence using the provided tool result only.",

@@ -100,10 +100,6 @@ pub struct Neo4jClient {
     pub graph: Graph,
 }
 
-fn neo4j_to_rig_error(e: neo4rs::Error) -> VectorStoreError {
-    VectorStoreError::DatastoreError(Box::new(e))
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Neo4jSearchFilter(String);
 
@@ -279,9 +275,9 @@ where
 impl Neo4jClient {
     const GET_INDEX_QUERY: &'static str = "
     SHOW VECTOR INDEXES
-    YIELD name, properties, options
+    YIELD name, labelsOrTypes, properties, options
     WHERE name=$index_name
-    RETURN name, properties, options
+    RETURN name, labelsOrTypes, properties, options
     ";
 
     const SHOW_INDEXES_QUERY: &'static str = "SHOW VECTOR INDEXES YIELD name RETURN name";
@@ -294,7 +290,7 @@ impl Neo4jClient {
         tracing::info!("Connecting to Neo4j DB at {} ...", uri);
         let graph = Graph::new(uri, user, password)
             .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
+            .map_err(VectorStoreError::datastore)?;
         tracing::info!("Connected to Neo4j");
         Ok(Self { graph })
     }
@@ -302,7 +298,7 @@ impl Neo4jClient {
     pub async fn from_config(config: Config) -> Result<Self, VectorStoreError> {
         let graph = Graph::connect(config)
             .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
+            .map_err(VectorStoreError::datastore)?;
         Ok(Self { graph })
     }
 
@@ -313,11 +309,11 @@ impl Neo4jClient {
         graph
             .execute(query)
             .await
-            .map_err(neo4j_to_rig_error)?
+            .map_err(VectorStoreError::datastore)?
             .into_stream_as::<T>()
             .try_collect::<Vec<T>>()
             .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))
+            .map_err(VectorStoreError::datastore)
     }
 
     /// Returns a `Neo4jVectorIndex` that mirrors an existing Neo4j Vector Index.
@@ -332,8 +328,10 @@ impl Neo4jClient {
         index_name: &str,
     ) -> Result<Neo4jVectorIndex<M>, VectorStoreError> {
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct IndexInfo {
             name: String,
+            labels_or_types: Vec<String>,
             properties: Vec<String>,
             options: IndexOptions,
         }
@@ -369,27 +367,31 @@ impl Neo4jClient {
                 );
             }
             let embedding_property = index.properties.first().ok_or_else(|| {
-                VectorStoreError::DatastoreError(Box::new(std::io::Error::other(
-                    "Neo4j index is missing an embedding property",
-                )))
+                VectorStoreError::DatastoreError(
+                    "Neo4j index is missing an embedding property".into(),
+                )
             })?;
-            IndexConfig::new(index.name.clone())
+            let mut config = IndexConfig::new(index.name.clone())
                 .embedding_property(embedding_property)
                 .similarity_function(VectorSimilarityFunction::from_str(
                     &index.options.index_config.vector_similarity_function,
-                )?)
+                )?);
+            // Preserve the node label the index is attached to so `insert_documents`
+            // writes to the same label.
+            if let Some(label) = index.labels_or_types.first() {
+                config = config.node_label(label);
+            }
+            config
         } else {
             let indexes = Self::execute_and_collect::<String>(
                 &self.graph,
                 neo4rs::query(Self::SHOW_INDEXES_QUERY),
             )
             .await?;
-            return Err(VectorStoreError::DatastoreError(Box::new(
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "Index `{index_name}` not found in database. Available indexes: {indexes:?}"
-                    ),
+            return Err(VectorStoreError::datastore(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Index `{index_name}` not found in database. Available indexes: {indexes:?}"
                 ),
             )));
         };
@@ -445,7 +447,7 @@ impl Neo4jClient {
                     .param("dimensions", model.ndims() as i64),
             )
             .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
+            .map_err(VectorStoreError::datastore)?;
 
         // Check if the index exists with db.awaitIndex(), the call timeouts if the index is not ready
         let index_exists = self

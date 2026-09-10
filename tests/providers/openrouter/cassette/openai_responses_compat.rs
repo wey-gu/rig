@@ -1,7 +1,7 @@
 //! Cassette-backed OpenRouter compatibility coverage through Rig's OpenAI Responses provider.
 
-use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, Prompt};
+use rig::prelude::*;
 use rig::streaming::StreamingPrompt;
 
 use crate::support::{assert_nonempty_response, collect_stream_final_response};
@@ -15,18 +15,26 @@ async fn openai_responses_raw_response_accepts_service_tier_metadata() {
     with_openrouter_openai_cassette(
         "openai_responses_compat/openai_responses_raw_response_accepts_service_tier_metadata",
         |client| async move {
-            let response = client
+            let model = client
                 .completion_model(DEFAULT_OPENAI_COMPAT_MODEL)
+                .with_system_instructions_as_messages();
+            let request = model
                 .completion_request("Reply with exactly: openrouter responses service tier ok")
                 .preamble(
                     "Return the requested text exactly, with no extra commentary.".to_string(),
                 )
-                .send()
+                .build();
+
+            // `service_tier` is Responses-API metadata rig does not normalize,
+            // so it is read off the provider's own wire response. `completion`
+            // sends exactly this request, so the cassette still sees one
+            // interaction.
+            let response = model
+                .raw_completion(request)
                 .await
                 .expect("OpenRouter Responses API completion should deserialize");
 
             let service_tier = response
-                .raw_response
                 .additional_parameters
                 .service_tier
                 .as_ref()
@@ -47,6 +55,7 @@ async fn openai_responses_agent_prompt_against_openrouter_completes() {
         "openai_responses_compat/openai_responses_agent_prompt_against_openrouter_completes",
         |client| async move {
             let agent = client
+                .with_system_instructions_as_messages()
                 .agent(DEFAULT_OPENAI_COMPAT_MODEL)
                 .preamble("You are concise. Answer with one short sentence.")
                 .build();
@@ -68,6 +77,7 @@ async fn openai_responses_stream_against_openrouter_completes() {
         "openai_responses_compat/openai_responses_stream_against_openrouter_completes",
         |client| async move {
             let agent = client
+                .with_system_instructions_as_messages()
                 .agent(DEFAULT_OPENAI_COMPAT_MODEL)
                 .preamble("You are concise. Answer directly.")
                 .build();

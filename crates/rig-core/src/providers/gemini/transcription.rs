@@ -8,7 +8,9 @@ use crate::{
     http_client::HttpClientExt,
     providers::gemini::completion::gemini_api_types::{
         Blob, Content, GenerateContentRequest, GenerationConfig, Part, PartKind, Role,
+        visible_text_parts,
     },
+    providers::internal::transcription::send_json_transcription,
     transcription::{self, TranscriptionError},
     wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
@@ -18,21 +20,11 @@ use super::{Client, completion::gemini_api_types::GenerateContentResponse};
 const TRANSCRIPTION_PREAMBLE: &str =
     "Translate the provided audio exactly. Do not add additional information.";
 
-#[derive(Clone)]
-pub struct TranscriptionModel<T = reqwest::Client> {
-    client: Client<T>,
-    /// Name of the model (e.g.: gemini-1.5-flash)
-    pub model: String,
-}
-
-impl<T> TranscriptionModel<T> {
-    pub fn new(client: Client<T>, model: impl Into<String>) -> Self {
-        Self {
-            client,
-            model: model.into(),
-        }
-    }
-}
+pub type TranscriptionModel<T = reqwest::Client> =
+    crate::providers::internal::transcription::GenericTranscriptionModel<
+        crate::providers::gemini::client::GeminiExt,
+        T,
+    >;
 
 impl<T> transcription::TranscriptionModel for TranscriptionModel<T>
 where
@@ -103,35 +95,31 @@ where
         );
 
         let body = serde_json::to_vec(&request)?;
-        let req = self
-            .client
-            .post(format!("/v1beta/models/{}:generateContent", self.model))?
-            .body(body)
-            .map_err(|e| TranscriptionError::HttpError(e.into()))?;
 
-        let response = self.client.send::<_, Vec<u8>>(req).await?;
+        send_json_transcription(
+            &self.client,
+            self.client
+                .post(format!("/v1beta/models/{}:generateContent", self.model))?,
+            body,
+            |_, body| {
+                let body: GenerateContentResponse = serde_json::from_slice(body)?;
 
-        if response.status().is_success() {
-            let body: GenerateContentResponse =
-                serde_json::from_slice(&response.into_body().await?)?;
+                match body.usage_metadata {
+                    Some(ref usage) => tracing::info!(target: "rig",
+                    "Gemini completion token usage: {}",
+                    usage
+                    ),
+                    None => tracing::info!(target: "rig",
+                        "Gemini completion token usage: n/a",
+                    ),
+                }
 
-            match body.usage_metadata {
-                Some(ref usage) => tracing::info!(target: "rig",
-                "Gemini completion token usage: {}",
-                usage
-                ),
-                None => tracing::info!(target: "rig",
-                    "Gemini completion token usage: n/a",
-                ),
-            }
+                tracing::debug!("Received response");
 
-            tracing::debug!("Received response");
-
-            Ok(transcription::TranscriptionResponse::try_from(body)?)
-        } else {
-            let text = String::from_utf8_lossy(&response.into_body().await?).into();
-            Err(TranscriptionError::ProviderError(text))
-        }
+                transcription::TranscriptionResponse::try_from(body)
+            },
+        )
+        .await
     }
 }
 
@@ -145,31 +133,81 @@ impl TryFrom<GenerateContentResponse>
             TranscriptionError::ResponseError("No response candidates in response".into())
         })?;
 
-        let part = candidate
+        // The transcript is *every* visible text part, concatenated. Reading
+        // only `parts.first()` mistook the two shapes Gemini routinely
+        // returns here: a thinking model answers with its chain-of-thought in
+        // parts[0] (`thought: true`) and the transcript after it, so the
+        // reasoning was returned as the transcript and the transcript was
+        // dropped; and a transcript split across several text parts kept only
+        // the first. `visible_text_parts` is the shared skip-the-thoughts rule
+        // — no separator is invented between parts, because Gemini's split
+        // points are not sentence boundaries.
+        //
+        // "No text" stays a *structural* question — are there visible text
+        // parts at all — rather than "is the joined string empty". A turn
+        // whose text part is genuinely empty still converted before this
+        // change, and still does.
+        let mut parts = candidate
             .content
             .as_ref()
-            .and_then(|content| content.parts.first());
+            .map(visible_text_parts)
+            .into_iter()
+            .flatten()
+            .peekable();
+        if parts.peek().is_none() {
+            return Err(TranscriptionError::ResponseError(
+                "Response content contains no text".to_string(),
+            ));
+        }
+        let text = parts.collect::<String>();
 
-        let text = match part {
-            Some(Part {
-                part: PartKind::Text(text),
-                ..
-            }) => text,
-            None => {
-                return Err(TranscriptionError::ResponseError(
-                    "Response content contains no text".to_string(),
-                ));
-            }
-            _ => {
-                return Err(TranscriptionError::ResponseError(
-                    "Response content was not text".to_string(),
-                ));
-            }
-        };
+        Ok(transcription::TranscriptionResponse { text, response })
+    }
+}
 
-        Ok(transcription::TranscriptionResponse {
-            text: text.to_string(),
-            response,
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::transcription::TranscriptionClient;
+    use crate::providers::gemini::Client;
+    use crate::providers::gemini::completion::GEMINI_2_0_FLASH;
+    use crate::test_utils::RecordingHttpClient;
+    use crate::transcription::TranscriptionModel as _;
+
+    fn transcription_request() -> transcription::TranscriptionRequest {
+        transcription::TranscriptionRequest {
+            data: b"audio bytes".to_vec(),
+            filename: "audio.mp3".to_string(),
+            language: None,
+            prompt: None,
+            temperature: None,
+            additional_params: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn transcription_non_success_preserves_status_and_body() {
+        let body = r#"{"error":{"code":503,"message":"boom","status":"UNAVAILABLE"}}"#;
+        let http_client =
+            RecordingHttpClient::with_error_response(http::StatusCode::SERVICE_UNAVAILABLE, body);
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(http_client)
+            .build()
+            .expect("build client");
+        let model = client.transcription_model(GEMINI_2_0_FLASH);
+
+        let error = model
+            .transcription(transcription_request())
+            .await
+            .err()
+            .expect("should fail with non-success status");
+
+        assert!(matches!(error, TranscriptionError::HttpError(_)));
+        assert_eq!(
+            error.provider_response_status(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(error.provider_response_body(), Some(body));
     }
 }

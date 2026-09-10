@@ -3,10 +3,7 @@ use http::{HeaderName, HeaderValue};
 
 use super::completion::{ANTHROPIC_VERSION_LATEST, CompletionModel};
 use crate::{
-    client::{
-        self, ApiKey, Capabilities, Capable, DebugExt, Nothing, Provider, ProviderBuilder,
-        ProviderClient,
-    },
+    client::{self, ApiKey, DebugExt, Provider, ProviderBuilder},
     http_client::{self, HttpClientExt},
     providers::anthropic::model_listing::AnthropicModelLister,
 };
@@ -22,17 +19,11 @@ impl Provider for AnthropicExt {
     const VERIFY_PATH: &'static str = "/v1/models";
 }
 
-impl<H> Capabilities<H> for AnthropicExt {
-    type Completion = Capable<CompletionModel<H>>;
-
-    type Embeddings = Nothing;
-    type Transcription = Nothing;
-    type ModelListing = Capable<AnthropicModelLister<H>>;
-    #[cfg(feature = "image")]
-    type ImageGeneration = Nothing;
-    #[cfg(feature = "audio")]
-    type AudioGeneration = Nothing;
-}
+client::impl_capabilities!(
+    AnthropicExt,
+    completion = CompletionModel<H>,
+    model_listing = AnthropicModelLister<H>,
+);
 
 #[derive(Debug, Clone)]
 pub struct AnthropicBuilder {
@@ -103,26 +94,12 @@ impl ProviderBuilder for AnthropicBuilder {
 
 impl DebugExt for AnthropicExt {}
 
-impl ProviderClient for Client {
-    type Input = String;
-    type Error = crate::client::ProviderClientError;
-
-    fn from_env() -> Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        let key = crate::client::required_env_var("ANTHROPIC_API_KEY")?;
-
-        Self::builder().api_key(key).build().map_err(Into::into)
-    }
-
-    fn from_val(input: Self::Input) -> Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        Self::builder().api_key(input).build().map_err(Into::into)
-    }
-}
+client::impl_provider_client!(
+    Client,
+    input = String,
+    api_key_env = "ANTHROPIC_API_KEY",
+    base_url_env_first = "ANTHROPIC_BASE_URL",
+);
 
 /// Create a new anthropic client using the builder
 ///
@@ -205,8 +182,101 @@ where
 
     Ok(builder)
 }
+
+// The remaining compatible-client repetition is inherent builder methods and
+// a ProviderBuilder implementation, neither of which ordinary functions can
+// generate. Keep the actual header behavior in `finish_anthropic_builder` and
+// generate only this type-level plumbing.
+macro_rules! impl_anthropic_compatible_builder {
+    ($builder:ty => $extension:ty, base_url = $base_url:expr $(,)?) => {
+        $crate::client::impl_default_provider_builder!(
+            $builder => $extension,
+            api_key = $crate::providers::anthropic::client::AnthropicKey,
+            base_url = $base_url,
+            finish = $crate::providers::anthropic::client::finish_anthropic_builder,
+            state = anthropic,
+        );
+
+        impl<H>
+            $crate::client::ClientBuilder<
+                $builder,
+                $crate::providers::anthropic::client::AnthropicKey,
+                H,
+            >
+        {
+            pub fn anthropic_version(self, anthropic_version: &str) -> Self {
+                self.over_ext(|mut ext| {
+                    ext.anthropic.anthropic_version = anthropic_version.into();
+                    ext
+                })
+            }
+
+            pub fn anthropic_betas(self, anthropic_betas: &[&str]) -> Self {
+                self.over_ext(|mut ext| {
+                    ext.anthropic
+                        .anthropic_betas
+                        .extend(anthropic_betas.iter().copied().map(String::from));
+                    ext
+                })
+            }
+
+            pub fn anthropic_beta(self, anthropic_beta: &str) -> Self {
+                self.over_ext(|mut ext| {
+                    ext.anthropic.anthropic_betas.push(anthropic_beta.into());
+                    ext
+                })
+            }
+        }
+    };
+}
+pub(crate) use impl_anthropic_compatible_builder;
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use crate::client::ProviderClient;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: Tests in this module hold ENV_LOCK while mutating process
+            // environment and restore the original value before releasing it.
+            unsafe { std::env::set_var(key, value) };
+
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: Tests in this module hold ENV_LOCK while mutating process
+            // environment and restore the original value before releasing it.
+            unsafe { std::env::remove_var(key) };
+
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: Tests in this module hold ENV_LOCK while mutating process
+            // environment and restore the original value before releasing it.
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_client_initialization() {
         let _client =
@@ -215,5 +285,36 @@ mod tests {
             .api_key("dummy-key")
             .build()
             .expect("Client::builder() failed");
+    }
+
+    #[test]
+    fn from_env_uses_anthropic_base_url() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", "dummy-key");
+        let _base_url = EnvVarGuard::set(
+            "ANTHROPIC_BASE_URL",
+            "https://anthropic-compatible.example/v1/messages",
+        );
+
+        let client = crate::providers::anthropic::Client::from_env()
+            .expect("Client::from_env should build with ANTHROPIC_BASE_URL");
+
+        assert_eq!(
+            client.base_url(),
+            "https://anthropic-compatible.example",
+            "from_env should apply ANTHROPIC_BASE_URL and the existing Anthropic base URL normalization"
+        );
+    }
+
+    #[test]
+    fn from_env_uses_default_base_url_when_anthropic_base_url_is_unset() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", "dummy-key");
+        let _base_url = EnvVarGuard::remove("ANTHROPIC_BASE_URL");
+
+        let client = crate::providers::anthropic::Client::from_env()
+            .expect("Client::from_env should build without ANTHROPIC_BASE_URL");
+
+        assert_eq!(client.base_url(), "https://api.anthropic.com");
     }
 }

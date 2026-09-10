@@ -11,15 +11,13 @@ struct FacadeCoordinates {
 fn facade_find_nearby(
     /// Location to search from
     location: FacadeCoordinates,
-) -> Result<String, rig::tool::ToolError> {
+) -> Result<String, rig::tool::ToolExecutionError> {
     Ok(format!("{},{}", location.lat, location.lng))
 }
 
 #[tokio::test]
 async fn test_tool_macro_accepts_facade_schemars_reexport() {
-    use rig::tool::Tool;
-
-    let definition = FacadeFindNearby.definition(String::default()).await;
+    let definition = rig::tool::tool_definition(&FacadeFindNearby);
     let schema = serde_json::to_string(&definition.parameters).unwrap();
 
     assert!(schema.contains("lat"), "expected lat in schema: {schema}");

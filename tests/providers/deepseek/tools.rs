@@ -1,7 +1,7 @@
 //! DeepSeek tools smoke test.
 
-use rig::client::CompletionClient;
 use rig::completion::Prompt;
+use rig::prelude::*;
 use rig::providers::deepseek;
 
 use super::support::with_deepseek_cassette;
@@ -17,6 +17,7 @@ async fn tools_smoke() {
             .preamble(TOOLS_PREAMBLE)
             .tool(Adder)
             .tool(Subtract)
+            .default_max_turns(2)
             .build();
 
         let response = agent

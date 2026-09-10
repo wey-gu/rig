@@ -7,7 +7,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"You are a helpful assistant.","type":"text"}],"role":"system"},{"content":"hello","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"allow_fallbacks":true,"order":["DeepInfra","DeepSeek","Chutes"]}}'
+  body: '{"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"hello","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"allow_fallbacks":true,"order":["DeepInfra","DeepSeek","Chutes"]}}'
 then:
   status: 200
   header:
@@ -24,7 +24,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"You are a helpful assistant.","type":"text"}],"role":"system"},{"content":"planet","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"ignore":["Google Vertex"]}}'
+  body: '{"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"planet","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"ignore":["Google Vertex"]}}'
 then:
   status: 200
   header:
@@ -41,7 +41,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"You are a helpful assistant.","type":"text"}],"role":"system"},{"content":"french hello","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"sort":"latency"}}'
+  body: '{"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"french hello","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"sort":"latency"}}'
 then:
   status: 200
   header:
@@ -58,7 +58,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"You are a helpful assistant.","type":"text"}],"role":"system"},{"content":"sky color","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"require_parameters":true}}'
+  body: '{"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"sky color","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"require_parameters":true}}'
 then:
   status: 200
   header:
@@ -75,7 +75,7 @@ when:
     value: '*/*'
   - name: content-type
     value: application/json
-  body: '{"messages":[{"content":[{"text":"You are a helpful assistant.","type":"text"}],"role":"system"},{"content":"country","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"max_price":{"completion":0.5,"prompt":0.3}}}'
+  body: '{"messages":[{"content":"You are a helpful assistant.","role":"system"},{"content":"country","role":"user"}],"model":"deepseek/deepseek-v3.2","provider":{"max_price":{"completion":0.5,"prompt":0.3}}}'
 then:
   status: 200
   header:
