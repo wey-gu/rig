@@ -56,6 +56,8 @@ fn tool_call_chunk(
         id: id.map(ToOwned::to_owned),
         name: name.map(ToOwned::to_owned),
         arguments: arguments.map(ToOwned::to_owned),
+        signature: None,
+        additional_params: None,
     }
 }
 

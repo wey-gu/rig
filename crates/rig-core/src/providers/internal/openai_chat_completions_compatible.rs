@@ -316,6 +316,8 @@ pub(crate) struct CompatibleToolCallChunk {
     pub(crate) id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) arguments: Option<String>,
+    pub(crate) signature: Option<String>,
+    pub(crate) additional_params: Option<serde_json::Value>,
 }
 
 impl CompatibleToolCallChunk {
@@ -691,6 +693,22 @@ where
                 incoming.id.as_deref(),
                 incoming.name.as_deref(),
             );
+
+            // Per-call provider metadata belongs to the same indexed slot as
+            // the function fragments. Preserve it until ToolInputEnd closes
+            // the call; never spread one call's signature to its parallel
+            // siblings.
+            if slot.signature.is_none() {
+                slot.signature = incoming.signature.clone();
+            }
+            if let Some(incoming_params) = incoming.additional_params.clone() {
+                match slot.additional_params.as_mut() {
+                    Some(accumulated) => {
+                        crate::json_utils::merge_inplace(accumulated, incoming_params)
+                    }
+                    None => slot.additional_params = Some(incoming_params),
+                }
+            }
 
             if let Some(name) = incoming.name.as_ref()
                 && !name.is_empty()

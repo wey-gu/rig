@@ -36,8 +36,15 @@ pub(crate) struct StreamingToolCall {
     #[serde(default)]
     pub(crate) index: usize,
     pub(crate) id: Option<String>,
+    // A standard Chat Completions field, not provider metadata. It is not
+    // needed for assembly (only `function` exists today), but declaring it
+    // keeps the flattened extension map from replaying it as an extra.
+    #[serde(default, rename = "type")]
+    pub(crate) _type: Option<super::ToolType>,
     #[serde(default, deserialize_with = "json_utils::null_or_default")]
     pub(crate) function: StreamingFunction,
+    #[serde(flatten)]
+    pub(crate) additional_params: serde_json::Map<String, serde_json::Value>,
 }
 
 impl From<&StreamingToolCall> for CompatibleToolCallChunk {
@@ -47,6 +54,9 @@ impl From<&StreamingToolCall> for CompatibleToolCallChunk {
             id: value.id.clone(),
             name: value.function.name.clone(),
             arguments: value.function.arguments.clone(),
+            signature: super::google_thought_signature(&value.additional_params),
+            additional_params: (!value.additional_params.is_empty())
+                .then_some(serde_json::Value::Object(value.additional_params.clone())),
         }
     }
 }
@@ -1483,6 +1493,48 @@ mod tests {
             collected_tool_calls[0].function.arguments,
             serde_json::json!({"id": 1})
         );
+    }
+
+    /// Gemini emits `extra_content.google.thought_signature` on the signed
+    /// call's streaming delta. It must close with that exact call even when a
+    /// parallel sibling is present; copying it to every call corrupts replay.
+    #[tokio::test]
+    async fn test_gemini_tool_call_signature_stays_on_its_parallel_call() {
+        use crate::test_utils::MockStreamingClient;
+        use futures::StreamExt;
+
+        let client = MockStreamingClient {
+            sse_bytes: sse_bytes_from_data_lines([
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_signed","function":{"name":"lookup","arguments":"{\"q\":\"alpha\"}"},"extra_content":{"google":{"thought_signature":"sig-A"}},"relay_trace":"keep-me"},{"index":1,"id":"call_unsigned","function":{"name":"lookup","arguments":"{\"q\":\"beta\"}"}}]},"finish_reason":null}],"usage":null}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[]},"finish_reason":"tool_calls"}],"usage":null}"#,
+                "[DONE]",
+            ]),
+        };
+
+        let mut stream = send_compatible_streaming_request(client, streaming_request(), "openai")
+            .await
+            .unwrap();
+        let mut calls = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            if let streaming::StreamedAssistantContent::ToolCall { tool_call, .. } = chunk.unwrap()
+            {
+                calls.push(tool_call);
+            }
+        }
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].wire_call_id(), "call_signed");
+        assert_eq!(calls[0].signature.as_deref(), Some("sig-A"));
+        assert_eq!(
+            calls[0]
+                .additional_params
+                .as_ref()
+                .and_then(|value| value.get("relay_trace")),
+            Some(&serde_json::json!("keep-me"))
+        );
+        assert_eq!(calls[1].wire_call_id(), "call_unsigned");
+        assert_eq!(calls[1].signature, None);
+        assert_eq!(calls[1].additional_params, None);
     }
 
     /// Reproduces the bug where a provider (e.g. GLM-4 via OpenAI-compatible

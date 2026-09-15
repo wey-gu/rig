@@ -8,6 +8,7 @@ still required by Nowledge Mem after upgrading from its v0.38.2 fork.
 | Headless ChatGPT OAuth cannot wait indefinitely | Injectable OAuth HTTP client; bounded defaults; token-safe deadline errors |
 | OpenAI-compatible system prompts | Serialize system content as a plain string |
 | Provider cache accounting | Preserve `prompt_tokens_details.cache_write_tokens` in normalized usage |
+| Gemini through OpenAI-compatible relays | Preserve each call's provider extensions and thought signature across normalization, streaming, and history replay |
 | Strict tool object schemas | Normalize snake-case additional properties and close every object schema |
 | Responses gateway capabilities | Consume existing caller controls for instruction placement and omitted temperature/output limits, using the upstream instruction placement policy |
 | Delta-less Responses output | Recover unseen text/refusal parts from done/completed frames without duplicating streamed parts |
