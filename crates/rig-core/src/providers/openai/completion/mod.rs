@@ -459,6 +459,12 @@ pub struct ToolCall {
     #[serde(default)]
     pub r#type: ToolType,
     pub function: Function,
+    /// Provider extensions attached to this individual call. OpenAI-compatible
+    /// gateways are free to add fields here; flattening keeps them on the same
+    /// call when an assistant turn is replayed instead of silently discarding
+    /// them at the compatibility boundary.
+    #[serde(flatten)]
+    pub additional_params: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -930,6 +936,10 @@ impl TryFrom<message::Message> for Vec<Message> {
 
 impl From<message::ToolCall> for ToolCall {
     fn from(tool_call: message::ToolCall) -> Self {
+        let additional_params = tool_call_additional_params(
+            tool_call.signature.as_deref(),
+            tool_call.additional_params.as_ref(),
+        );
         Self {
             // Keep the assistant echo consistent with the tool-result side:
             // the provider-issued call id when one exists (e.g. a
@@ -941,12 +951,16 @@ impl From<message::ToolCall> for ToolCall {
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
             },
+            additional_params,
         }
     }
 }
 
 impl From<ToolCall> for message::ToolCall {
     fn from(tool_call: ToolCall) -> Self {
+        let signature = google_thought_signature(&tool_call.additional_params);
+        let additional_params = (!tool_call.additional_params.is_empty())
+            .then_some(serde_json::Value::Object(tool_call.additional_params));
         message::ToolCall::from_wire(
             tool_call.id,
             message::ToolFunction {
@@ -954,7 +968,62 @@ impl From<ToolCall> for message::ToolCall {
                 arguments: tool_call.function.arguments,
             },
         )
+        .with_signature(signature)
+        .with_additional_params(additional_params)
     }
+}
+
+fn google_thought_signature(
+    additional_params: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    additional_params
+        .get("extra_content")?
+        .get("google")?
+        .get("thought_signature")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn tool_call_additional_params(
+    signature: Option<&str>,
+    additional_params: Option<&serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut params = additional_params
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    // These are the typed wire fields, never provider extensions. Removing
+    // them prevents a manually-built core call from serializing duplicate
+    // object keys through the flattened map.
+    for key in ["id", "type", "function"] {
+        params.remove(key);
+    }
+
+    if let Some(signature) = signature {
+        let extra_content = params
+            .entry("extra_content")
+            .or_insert_with(|| serde_json::json!({}));
+        if !extra_content.is_object() {
+            *extra_content = serde_json::json!({});
+        }
+        if let Some(extra_content) = extra_content.as_object_mut() {
+            let google = extra_content
+                .entry("google")
+                .or_insert_with(|| serde_json::json!({}));
+            if !google.is_object() {
+                *google = serde_json::json!({});
+            }
+            if let Some(google) = google.as_object_mut() {
+                google.insert(
+                    "thought_signature".to_owned(),
+                    serde_json::Value::String(signature.to_owned()),
+                );
+            }
+        }
+    }
+
+    params
 }
 
 impl TryFrom<Message> for message::Message {
@@ -1228,13 +1297,12 @@ impl crate::completion::NormalizeCompletionResponse for CompletionResponse {
                         content.push(completion::AssistantContent::reasoning(reasoning));
                     }
 
-                    content.extend(tool_calls.iter().map(|call| {
-                        completion::AssistantContent::tool_call(
-                            &call.id,
-                            &call.function.name,
-                            call.function.arguments.clone(),
-                        )
-                    }));
+                    content.extend(
+                        tool_calls
+                            .iter()
+                            .cloned()
+                            .map(|call| completion::AssistantContent::ToolCall(call.into())),
+                    );
                     Some(content)
                 }
                 _ => None,
@@ -2980,6 +3048,91 @@ mod tests {
 
         let json = serde_json::to_value(&converted[0]).expect("serialize");
         assert_eq!(json["reasoning_content"], "hidden");
+    }
+
+    /// Gemini's OpenAI-compatible endpoint attaches a thought signature to
+    /// the first call in a parallel batch. The signature belongs to that
+    /// exact call: response normalization and history replay must preserve its
+    /// position, the provider-issued ids, and unrelated extension fields.
+    #[test]
+    fn gemini_tool_call_extensions_roundtrip_without_cross_call_propagation() {
+        use crate::completion::NormalizeCompletionResponse;
+
+        let response: CompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-gemini",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gemini-2.5-flash",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_signed",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{\"q\":\"alpha\"}"},
+                            "extra_content": {
+                                "google": {"thought_signature": "sig-A"}
+                            },
+                            "relay_trace": "keep-me"
+                        },
+                        {
+                            "id": "call_unsigned",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{\"q\":\"beta\"}"}
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("Gemini-compatible response should decode");
+
+        let normalized = response
+            .normalize("openai")
+            .expect("tool calls should normalize");
+        let calls = normalized
+            .choice
+            .iter()
+            .filter_map(|content| match content {
+                completion::AssistantContent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].wire_call_id(), "call_signed");
+        assert_eq!(calls[0].signature.as_deref(), Some("sig-A"));
+        assert_eq!(calls[1].wire_call_id(), "call_unsigned");
+        assert_eq!(
+            calls[1].signature, None,
+            "signature is not copied to a sibling"
+        );
+        assert_eq!(
+            calls[0]
+                .additional_params
+                .as_ref()
+                .and_then(|value| value.get("relay_trace")),
+            Some(&json!("keep-me"))
+        );
+
+        let replay = assistant_content_to_messages(normalized.choice)
+            .expect("normalized history should replay");
+        let replay = serde_json::to_value(replay).expect("replay should serialize");
+        let replay_calls = replay[0]["tool_calls"]
+            .as_array()
+            .expect("assistant replay should contain tool calls");
+
+        assert_eq!(replay_calls[0]["id"], "call_signed");
+        assert_eq!(
+            replay_calls[0]["extra_content"]["google"]["thought_signature"],
+            "sig-A"
+        );
+        assert_eq!(replay_calls[0]["relay_trace"], "keep-me");
+        assert_eq!(replay_calls[1]["id"], "call_unsigned");
+        assert!(replay_calls[1].get("extra_content").is_none());
     }
 
     #[test]
