@@ -163,10 +163,11 @@ impl PlatformAuthenticator {
             .json(&serde_json::json!({ "client_id": CHATGPT_CLIENT_ID }))
             .send()
             .await
-            .map_err(|error| auth_request_error("device-code request", error))?
-            .error_for_status()?
-            .json::<DeviceCodeResponse>()
-            .await?;
+            .map_err(|error| auth_request_error("device-code request", error))?;
+        if !device.status().is_success() {
+            return Err(device_code_request_error(device.status(), device.headers()));
+        }
+        let device = device.json::<DeviceCodeResponse>().await?;
 
         emit_device_code_prompt(
             self.device_code_handler.0.as_ref(),
@@ -309,6 +310,40 @@ impl PlatformAuthenticator {
     }
 }
 
+fn device_code_request_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> AuthError {
+    let cloudflare_challenge = headers
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("challenge"));
+
+    let message = if status == reqwest::StatusCode::FORBIDDEN && cloudflare_challenge {
+        "ChatGPT device-code sign-in was blocked by a network security challenge (HTTP 403, Cloudflare). Try another network or disable a VPN, proxy, or content filter, then retry. The request failed before ChatGPT could check an account or plan."
+            .to_string()
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        "OpenAI denied the ChatGPT device-code request before sign-in began (HTTP 403). Retry later; if it persists, try another network and confirm device-code login is enabled in ChatGPT security settings. ChatGPT did not check an account or plan yet."
+            .to_string()
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        "ChatGPT device-code login is not available at this authentication server (HTTP 404). Verify the server URL or use a supported sign-in method."
+            .to_string()
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        "OpenAI temporarily rate-limited the ChatGPT device-code request (HTTP 429). Wait a moment, then retry Authenticate once."
+            .to_string()
+    } else if status.is_server_error() {
+        format!(
+            "OpenAI's authentication service is temporarily unavailable ({status}). Retry later; no ChatGPT account or plan was checked."
+        )
+    } else {
+        format!(
+            "ChatGPT device-code request failed before sign-in began ({status}). No ChatGPT account or plan was checked."
+        )
+    };
+
+    AuthError::Message(message)
+}
+
 fn default_oauth_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .connect_timeout(DEFAULT_OAUTH_CONNECT_TIMEOUT)
@@ -446,8 +481,8 @@ where
 mod tests {
     use super::{
         DeviceCodeHandler, DeviceCodeResponse, OAuthErrorResponse, OAuthTokenResponse,
-        PlatformAuthenticator, RefreshTokensError, build_auth_record, format_refresh_error,
-        should_reauthenticate_after_refresh,
+        PlatformAuthenticator, RefreshTokensError, build_auth_record, device_code_request_error,
+        format_refresh_error, should_reauthenticate_after_refresh,
     };
     use reqwest::StatusCode;
 
@@ -477,6 +512,75 @@ mod tests {
         .expect("device code response");
 
         assert_eq!(response.interval, Some(5));
+    }
+
+    #[test]
+    fn device_code_denials_have_stable_actionable_classes() {
+        let empty = reqwest::header::HeaderMap::new();
+
+        let denied = device_code_request_error(StatusCode::FORBIDDEN, &empty).to_string();
+        assert!(denied.contains("before sign-in began"), "{denied}");
+        assert!(
+            denied.contains("did not check an account or plan"),
+            "{denied}"
+        );
+
+        let unavailable = device_code_request_error(StatusCode::NOT_FOUND, &empty).to_string();
+        assert!(unavailable.contains("not available"), "{unavailable}");
+
+        let limited = device_code_request_error(StatusCode::TOO_MANY_REQUESTS, &empty).to_string();
+        assert!(limited.contains("rate-limited"), "{limited}");
+
+        let upstream =
+            device_code_request_error(StatusCode::SERVICE_UNAVAILABLE, &empty).to_string();
+        assert!(upstream.contains("temporarily unavailable"), "{upstream}");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_device_code_challenge_is_classified_without_echoing_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let secret_body = "sensitive-upstream-body-must-not-leak";
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\nCf-Mitigated: challenge\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{secret_body}",
+            secret_body.len()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write fixture response");
+        });
+        let auth = PlatformAuthenticator::new(
+            None,
+            Some(reqwest::Client::new()),
+            DeviceCodeHandler::default(),
+            true,
+        );
+        let endpoint = format!("http://{address}/device-code");
+
+        let error = auth
+            .login_device_flow_at(&endpoint, &endpoint, &endpoint)
+            .await
+            .expect_err("Cloudflare challenge must stop before polling")
+            .to_string();
+
+        server.await.expect("fixture server exits");
+        assert!(error.contains("network security challenge"), "{error}");
+        assert!(error.contains("Cloudflare"), "{error}");
+        assert!(
+            error.contains("before ChatGPT could check an account or plan"),
+            "{error}"
+        );
+        assert!(
+            !error.contains(secret_body),
+            "upstream response body leaked: {error}"
+        );
     }
 
     #[test]
