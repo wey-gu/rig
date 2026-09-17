@@ -1216,6 +1216,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_browser_callback_wait_releases_the_registered_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback fixture");
+        let address = listener.local_addr().expect("callback address");
+        let callback =
+            tokio::spawn(async move { wait_for_browser_callback(listener, "state").await });
+
+        callback.abort();
+        let cancelled = callback.await.expect_err("callback wait must be cancelled");
+        assert!(cancelled.is_cancelled());
+
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("cancelled callback wait must release its loopback port");
+        assert_eq!(rebound.local_addr().expect("rebound address"), address);
+    }
+
+    #[tokio::test]
     async fn fragmented_state_waits_for_complete_http_headers() {
         use tokio::io::AsyncWriteExt as _;
 
