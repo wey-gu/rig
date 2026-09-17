@@ -81,7 +81,7 @@ fn write_private_record(path: &Path, data: &[u8]) -> Result<(), std::io::Error> 
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut random = [0_u8; 12];
-    getrandom::fill(&mut random).map_err(std::io::Error::other)?;
+    getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
     let suffix = random
         .iter()
         .map(|byte| format!("{byte:02x}"))

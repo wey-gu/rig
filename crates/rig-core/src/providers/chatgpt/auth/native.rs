@@ -559,26 +559,39 @@ async fn wait_for_browser_callback(
     tokio::time::timeout(CHATGPT_BROWSER_CALLBACK_TIMEOUT, async move {
         let mut connections = tokio::task::JoinSet::new();
         loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let (mut stream, peer) = accepted?;
-                    if !peer.ip().is_loopback() {
-                        write_browser_callback_response(&mut stream, 403, "Forbidden").await;
-                        continue;
+            let accepted = if connections.is_empty() {
+                Some(listener.accept().await)
+            } else {
+                match futures::future::select(
+                    Box::pin(listener.accept()),
+                    Box::pin(connections.join_next()),
+                )
+                .await
+                {
+                    futures::future::Either::Left((accepted, _)) => Some(accepted),
+                    futures::future::Either::Right((completed, _)) => {
+                        match completed {
+                            Some(Ok(Some(Ok(code)))) => return Ok(code),
+                            Some(Ok(Some(Err(error)))) => return Err(error),
+                            Some(Ok(None) | Err(_)) | None => {}
+                        }
+                        None
                     }
-                    let expected_state = expected_state.to_string();
-                    connections.spawn(async move {
-                        handle_browser_callback_connection(&mut stream, &expected_state).await
-                    });
                 }
-                completed = connections.join_next(), if !connections.is_empty() => {
-                    match completed {
-                        Some(Ok(Some(Ok(code)))) => return Ok(code),
-                        Some(Ok(Some(Err(error)))) => return Err(error),
-                        Some(Ok(None) | Err(_)) | None => {}
-                    }
-                }
+            };
+
+            let Some(accepted) = accepted else {
+                continue;
+            };
+            let (mut stream, peer) = accepted?;
+            if !peer.ip().is_loopback() {
+                write_browser_callback_response(&mut stream, 403, "Forbidden").await;
+                continue;
             }
+            let expected_state = expected_state.to_string();
+            connections.spawn(async move {
+                handle_browser_callback_connection(&mut stream, &expected_state).await
+            });
         }
     })
     .await
