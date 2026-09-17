@@ -37,6 +37,8 @@ struct AuthRecord {
     id_token: Option<String>,
     expires_at: Option<i64>,
     account_id: Option<String>,
+    #[serde(default)]
+    reauth_required: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +94,10 @@ impl PlatformAuthenticator {
     pub(super) async fn auth_context_oauth(&self) -> Result<AuthContext, AuthError> {
         let mut record: AuthRecord = read_json_record(self.auth_file.as_deref())?;
 
+        if record.reauth_required && !self.allow_device_flow {
+            return Err(sign_in_required());
+        }
+
         if let Some(access_token) = record.access_token.clone()
             && !token_expired(record.expires_at, TOKEN_EXPIRY_SKEW_SECONDS)
         {
@@ -119,7 +125,14 @@ impl PlatformAuthenticator {
                         account_id: refreshed.account_id,
                     });
                 }
-                Err(RefreshTokensError::Reauthenticate) => {}
+                Err(RefreshTokensError::Reauthenticate) => {
+                    if let Some(context) = self.mark_reauth_required(
+                        record.access_token.as_deref(),
+                        Some(&refresh_token),
+                    )? {
+                        return Ok(context);
+                    }
+                }
                 Err(RefreshTokensError::Auth(err)) => return Err(err),
             }
         }
@@ -137,6 +150,100 @@ impl PlatformAuthenticator {
             access_token: fresh.access_token.unwrap_or_default(),
             account_id: fresh.account_id,
         })
+    }
+
+    pub(super) async fn refresh_after_rejection(
+        &self,
+        rejected_access_token: &str,
+    ) -> Result<AuthContext, AuthError> {
+        self.refresh_after_rejection_at(CHATGPT_OAUTH_TOKEN_URL, rejected_access_token)
+            .await
+    }
+
+    async fn refresh_after_rejection_at(
+        &self,
+        oauth_token_url: &str,
+        rejected_access_token: &str,
+    ) -> Result<AuthContext, AuthError> {
+        let record: AuthRecord = read_json_record(self.auth_file.as_deref())?;
+
+        // Another client may have refreshed while this request was in flight.
+        // Reuse that persisted credential instead of rotating the refresh token
+        // a second time.
+        if record.access_token.as_deref() != Some(rejected_access_token)
+            && let Some(access_token) = record.access_token.clone()
+            && !token_expired(record.expires_at, TOKEN_EXPIRY_SKEW_SECONDS)
+        {
+            return Ok(AuthContext {
+                account_id: record
+                    .account_id
+                    .or_else(|| extract_account_id(record.id_token.as_deref())),
+                access_token,
+            });
+        }
+
+        let Some(refresh_token) = record.refresh_token else {
+            if let Some(context) = self.mark_reauth_required(Some(rejected_access_token), None)? {
+                return Ok(context);
+            }
+            return Err(sign_in_required());
+        };
+        match self
+            .refresh_tokens_at(oauth_token_url, &refresh_token)
+            .await
+        {
+            Ok(refreshed) => {
+                write_json_record(self.auth_file.as_deref(), &refreshed)?;
+                Ok(AuthContext {
+                    access_token: refreshed.access_token.unwrap_or_default(),
+                    account_id: refreshed.account_id,
+                })
+            }
+            Err(RefreshTokensError::Reauthenticate) => {
+                if let Some(context) =
+                    self.mark_reauth_required(Some(rejected_access_token), Some(&refresh_token))?
+                {
+                    return Ok(context);
+                }
+                Err(sign_in_required())
+            }
+            Err(RefreshTokensError::Auth(error)) => Err(error),
+        }
+    }
+
+    fn mark_reauth_required(
+        &self,
+        expected_access_token: Option<&str>,
+        expected_refresh_token: Option<&str>,
+    ) -> Result<Option<AuthContext>, AuthError> {
+        let current: AuthRecord = read_json_record(self.auth_file.as_deref())?;
+        if current.access_token.as_deref() != expected_access_token
+            || current.refresh_token.as_deref() != expected_refresh_token
+        {
+            if let Some(access_token) = current.access_token.clone()
+                && !current.reauth_required
+                && !token_expired(current.expires_at, TOKEN_EXPIRY_SKEW_SECONDS)
+            {
+                return Ok(Some(AuthContext {
+                    account_id: current
+                        .account_id
+                        .or_else(|| extract_account_id(current.id_token.as_deref())),
+                    access_token,
+                }));
+            }
+            // A different writer changed the credential. Never erase its state
+            // based on this request's stale invalid_grant result; the next call
+            // can evaluate the complete record it left behind.
+            return Ok(None);
+        }
+        write_json_record(
+            self.auth_file.as_deref(),
+            &AuthRecord {
+                reauth_required: true,
+                ..AuthRecord::default()
+            },
+        )?;
+        Ok(None)
     }
 
     async fn login_device_flow(&self) -> Result<AuthRecord, AuthError> {
@@ -381,7 +488,15 @@ fn build_auth_record(
         access_token,
         refresh_token: tokens.refresh_token.or(previous_refresh_token),
         id_token,
+        reauth_required: false,
     }
+}
+
+fn sign_in_required() -> AuthError {
+    AuthError::Message(
+        "ChatGPT sign-in required. Reconnect ChatGPT in Settings before using this provider."
+            .into(),
+    )
 }
 
 fn extract_expiration_timestamp(token: &str) -> Option<i64> {
@@ -485,6 +600,40 @@ mod tests {
         format_refresh_error, should_reauthenticate_after_refresh,
     };
     use reqwest::StatusCode;
+
+    fn jwt_with_exp(exp: i64) -> String {
+        use base64::Engine as _;
+        use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string());
+        format!("header.{payload}.signature")
+    }
+
+    async fn one_response_server(
+        status: &str,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let status = status.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        (format!("http://{address}/token"), server)
+    }
 
     #[test]
     fn device_code_response_accepts_numeric_interval() {
@@ -715,5 +864,161 @@ mod tests {
             record.refresh_token.as_deref(),
             Some("cached-refresh-token")
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_access_token_refreshes_once_and_persists_the_replacement() {
+        let temp = assert_fs::TempDir::new().expect("temp auth directory");
+        let auth_file = temp.path().join("auth.json");
+        let old_access = jwt_with_exp(i64::MAX);
+        std::fs::write(
+            &auth_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "access_token": old_access,
+                "refresh_token": "refresh-1",
+                "expires_at": i64::MAX,
+            }))
+            .expect("serialize seed auth"),
+        )
+        .expect("write seed auth");
+        let new_access = jwt_with_exp(i64::MAX - 1);
+        let (endpoint, server) = one_response_server(
+            "200 OK",
+            serde_json::json!({
+                "access_token": new_access,
+                "refresh_token": "refresh-2",
+            })
+            .to_string(),
+        )
+        .await;
+        let auth = PlatformAuthenticator::new(
+            Some(auth_file.clone()),
+            Some(reqwest::Client::new()),
+            DeviceCodeHandler::default(),
+            false,
+        );
+
+        let refreshed = auth
+            .refresh_after_rejection_at(&endpoint, &old_access)
+            .await
+            .expect("rejected token should refresh");
+        server.await.expect("fixture server exits");
+        assert_eq!(refreshed.access_token, new_access);
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_file).expect("read persisted auth"))
+                .expect("parse persisted auth");
+        assert_eq!(persisted["access_token"], new_access);
+        assert_eq!(persisted["refresh_token"], "refresh-2");
+        assert_eq!(persisted["reauth_required"], false);
+    }
+
+    #[tokio::test]
+    async fn terminal_refresh_failure_persists_reauthentication_state() {
+        let temp = assert_fs::TempDir::new().expect("temp auth directory");
+        let auth_file = temp.path().join("auth.json");
+        let old_access = jwt_with_exp(i64::MAX);
+        std::fs::write(
+            &auth_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "access_token": old_access,
+                "refresh_token": "refresh-secret",
+                "expires_at": i64::MAX,
+            }))
+            .expect("serialize seed auth"),
+        )
+        .expect("write seed auth");
+        let (endpoint, server) = one_response_server(
+            "400 Bad Request",
+            serde_json::json!({"error": "invalid_grant"}).to_string(),
+        )
+        .await;
+        let auth = PlatformAuthenticator::new(
+            Some(auth_file.clone()),
+            Some(reqwest::Client::new()),
+            DeviceCodeHandler::default(),
+            false,
+        );
+
+        let error = auth
+            .refresh_after_rejection_at(&endpoint, &old_access)
+            .await
+            .expect_err("invalid refresh grant requires sign-in")
+            .to_string();
+        server.await.expect("fixture server exits");
+        assert!(error.contains("ChatGPT sign-in required"), "{error}");
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_file).expect("read terminal auth state"))
+                .expect("parse terminal auth state");
+        assert_eq!(persisted["reauth_required"], true);
+        assert!(persisted["access_token"].is_null());
+        assert!(persisted["refresh_token"].is_null());
+        assert!(!persisted.to_string().contains("refresh-secret"));
+    }
+
+    #[test]
+    fn stale_invalid_grant_cannot_erase_a_rotated_credential() {
+        let temp = assert_fs::TempDir::new().expect("temp auth directory");
+        let auth_file = temp.path().join("auth.json");
+        let replacement = jwt_with_exp(i64::MAX);
+        std::fs::write(
+            &auth_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "access_token": replacement,
+                "refresh_token": "refresh-rotated",
+                "expires_at": i64::MAX,
+            }))
+            .expect("serialize replacement auth"),
+        )
+        .expect("write replacement auth");
+        let auth = PlatformAuthenticator::new(
+            Some(auth_file.clone()),
+            Some(reqwest::Client::new()),
+            DeviceCodeHandler::default(),
+            false,
+        );
+
+        let context = auth
+            .mark_reauth_required(Some("access-rejected"), Some("refresh-stale"))
+            .expect("stale rejection should re-read the credential")
+            .expect("fresh rotated access token should be reused");
+        assert_eq!(context.access_token, replacement);
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_file).expect("read persisted auth"))
+                .expect("parse persisted auth");
+        assert_eq!(persisted["access_token"], replacement);
+        assert_eq!(persisted["refresh_token"], "refresh-rotated");
+        assert_ne!(persisted["reauth_required"], true);
+    }
+
+    #[tokio::test]
+    async fn rejected_request_reuses_a_newer_persisted_token_without_refreshing_again() {
+        let temp = assert_fs::TempDir::new().expect("temp auth directory");
+        let auth_file = temp.path().join("auth.json");
+        let replacement = jwt_with_exp(i64::MAX);
+        std::fs::write(
+            &auth_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "access_token": replacement,
+                "refresh_token": "refresh-must-not-be-used",
+                "expires_at": i64::MAX,
+            }))
+            .expect("serialize replacement auth"),
+        )
+        .expect("write replacement auth");
+        let auth = PlatformAuthenticator::new(
+            Some(auth_file),
+            Some(reqwest::Client::new()),
+            DeviceCodeHandler::default(),
+            false,
+        );
+
+        let recovered = auth
+            .refresh_after_rejection_at("http://127.0.0.1:1/must-not-run", "rejected-token")
+            .await
+            .expect("a concurrent refresh result should be reused");
+        assert_eq!(recovered.access_token, replacement);
     }
 }
