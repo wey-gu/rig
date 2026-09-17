@@ -116,6 +116,34 @@ where
         }
     }
 
+    /// Create an event source from a connection the provider already opened.
+    ///
+    /// Provider-specific admission logic sometimes needs the initial HTTP
+    /// status and body before handing the SSE stream to the shared state
+    /// machine (for example, a bounded credential refresh on an explicit
+    /// token-expired response). Seeding the state machine with that response
+    /// avoids issuing the request twice while preserving the ordinary
+    /// mid-stream reconnect policy and the initial [`Event::Open`] event.
+    pub(crate) fn from_response(
+        client: HttpClient,
+        req: Request<RequestBody>,
+        response: super::StreamingResponse,
+    ) -> Self {
+        let response_future: ResponseFuture = Box::pin(async move { Ok(response) });
+        Self {
+            client,
+            req,
+            retry_policy: DEFAULT_RETRY,
+            last_event_id: None,
+            allow_missing_content_type: false,
+            request_id_capture: None,
+            state: SourceState::Connecting {
+                response_future,
+                last_retry: None,
+            },
+        }
+    }
+
     pub fn allow_missing_content_type(mut self) -> Self {
         self.allow_missing_content_type = true;
         self

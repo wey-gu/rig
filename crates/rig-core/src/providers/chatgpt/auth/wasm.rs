@@ -3,6 +3,8 @@
 use super::{AuthContext, AuthError, DeviceCodeHandler};
 use std::path::PathBuf;
 
+pub(super) struct PendingDeviceFlow;
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct PlatformAuthenticator;
 
@@ -16,7 +18,28 @@ impl PlatformAuthenticator {
         Self
     }
 
-    pub(super) async fn auth_context_oauth(&self) -> Result<AuthContext, AuthError> {
+    pub(super) fn device_flow_allowed(&self) -> bool {
+        false
+    }
+
+    pub(super) async fn cached_or_refreshed_context(
+        &self,
+    ) -> Result<Option<AuthContext>, AuthError> {
+        Err(AuthError::Message(
+            "ChatGPT OAuth is not supported on wasm targets".into(),
+        ))
+    }
+
+    pub(super) async fn login_device_flow(&self) -> Result<PendingDeviceFlow, AuthError> {
+        Err(AuthError::Message(
+            "ChatGPT OAuth is not supported on wasm targets".into(),
+        ))
+    }
+
+    pub(super) fn persist_device_flow(
+        &self,
+        _fresh: PendingDeviceFlow,
+    ) -> Result<AuthContext, AuthError> {
         Err(AuthError::Message(
             "ChatGPT OAuth is not supported on wasm targets".into(),
         ))

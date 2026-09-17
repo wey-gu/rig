@@ -31,7 +31,7 @@ pub(super) struct PlatformAuthenticator {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-struct AuthRecord {
+pub(super) struct AuthRecord {
     access_token: Option<String>,
     refresh_token: Option<String>,
     id_token: Option<String>,
@@ -91,11 +91,17 @@ impl PlatformAuthenticator {
         }
     }
 
-    pub(super) async fn auth_context_oauth(&self) -> Result<AuthContext, AuthError> {
+    pub(super) fn device_flow_allowed(&self) -> bool {
+        self.allow_device_flow
+    }
+
+    pub(super) async fn cached_or_refreshed_context(
+        &self,
+    ) -> Result<Option<AuthContext>, AuthError> {
         let mut record: AuthRecord = read_json_record(self.auth_file.as_deref())?;
 
-        if record.reauth_required && !self.allow_device_flow {
-            return Err(sign_in_required());
+        if record.reauth_required {
+            return Ok(None);
         }
 
         if let Some(access_token) = record.access_token.clone()
@@ -110,41 +116,46 @@ impl PlatformAuthenticator {
                 record.account_id = account_id.clone();
                 write_json_record(self.auth_file.as_deref(), &record)?;
             }
-            return Ok(AuthContext {
+            return Ok(Some(AuthContext {
                 access_token,
                 account_id,
-            });
+            }));
         }
 
         if let Some(refresh_token) = record.refresh_token.clone() {
             match self.refresh_tokens(&refresh_token).await {
                 Ok(refreshed) => {
                     write_json_record(self.auth_file.as_deref(), &refreshed)?;
-                    return Ok(AuthContext {
+                    return Ok(Some(AuthContext {
                         access_token: refreshed.access_token.unwrap_or_default(),
                         account_id: refreshed.account_id,
-                    });
+                    }));
                 }
                 Err(RefreshTokensError::Reauthenticate) => {
                     if let Some(context) = self.mark_reauth_required(
                         record.access_token.as_deref(),
                         Some(&refresh_token),
                     )? {
-                        return Ok(context);
+                        return Ok(Some(context));
                     }
                 }
                 Err(RefreshTokensError::Auth(err)) => return Err(err),
             }
         }
 
-        if !self.allow_device_flow {
-            return Err(AuthError::Message(
-                "ChatGPT sign-in required. Reconnect ChatGPT in Settings before using this provider."
-                    .into(),
-            ));
-        }
+        Ok(None)
+    }
 
-        let fresh = self.login_device_flow().await?;
+    pub(super) async fn login_device_flow(&self) -> Result<AuthRecord, AuthError> {
+        self.login_device_flow_at(
+            CHATGPT_DEVICE_CODE_URL,
+            CHATGPT_DEVICE_TOKEN_URL,
+            CHATGPT_OAUTH_TOKEN_URL,
+        )
+        .await
+    }
+
+    pub(super) fn persist_device_flow(&self, fresh: AuthRecord) -> Result<AuthContext, AuthError> {
         write_json_record(self.auth_file.as_deref(), &fresh)?;
         Ok(AuthContext {
             access_token: fresh.access_token.unwrap_or_default(),
@@ -244,15 +255,6 @@ impl PlatformAuthenticator {
             },
         )?;
         Ok(None)
-    }
-
-    async fn login_device_flow(&self) -> Result<AuthRecord, AuthError> {
-        self.login_device_flow_at(
-            CHATGPT_DEVICE_CODE_URL,
-            CHATGPT_DEVICE_TOKEN_URL,
-            CHATGPT_OAUTH_TOKEN_URL,
-        )
-        .await
     }
 
     async fn login_device_flow_at(
@@ -759,13 +761,14 @@ mod tests {
     #[tokio::test]
     async fn noninteractive_oauth_requires_sign_in_instead_of_device_flow() {
         let auth = PlatformAuthenticator::new(None, None, DeviceCodeHandler::default(), false);
-        let err = auth
-            .auth_context_oauth()
+        let context = auth
+            .cached_or_refreshed_context()
             .await
-            .expect_err("missing cached auth should not start device flow")
-            .to_string();
-
-        assert!(err.contains("ChatGPT sign-in required"), "{err}");
+            .expect("missing cached auth is not a transport failure");
+        assert!(
+            context.is_none(),
+            "missing cached auth must request sign-in without starting device flow"
+        );
     }
 
     #[tokio::test]

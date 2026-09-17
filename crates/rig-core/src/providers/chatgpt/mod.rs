@@ -671,7 +671,7 @@ where
         );
 
         let body = serde_json::to_vec(&request)?;
-        let auth = self
+        let mut auth = self
             .client
             .ext()
             .auth
@@ -679,10 +679,39 @@ where
             .await
             .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
 
-        let req = self
+        let mut req = self
             .add_auth_headers(self.client.post("/responses")?, &auth)
-            .body(body)
+            .body(body.clone())
             .map_err(|err| CompletionError::HttpError(err.into()))?;
+
+        let response = match self.client.send_streaming(req.clone()).await {
+            Ok(response) => response,
+            Err(error)
+                if error.non_success_status().is_some_and(|status| {
+                    wire::is_expired_token_response(
+                        status,
+                        error.non_success_body().unwrap_or_default(),
+                    )
+                }) =>
+            {
+                auth = self
+                    .client
+                    .ext()
+                    .auth
+                    .refresh_after_rejection(&auth)
+                    .await
+                    .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
+                req = self
+                    .add_auth_headers(self.client.post("/responses")?, &auth)
+                    .body(body)
+                    .map_err(|err| CompletionError::HttpError(err.into()))?;
+                self.client
+                    .send_streaming(req.clone())
+                    .await
+                    .map_err(CompletionError::HttpError)?
+            }
+            Err(error) => return Err(CompletionError::HttpError(error)),
+        };
 
         let span = CompletionSpanBuilder::new(
             PROVIDER_NAME,
@@ -693,8 +722,9 @@ where
         .build();
 
         let client = self.client.clone();
-        let event_source = crate::http_client::sse::GenericEventSource::new(client, req)
-            .allow_missing_content_type();
+        let event_source =
+            crate::http_client::sse::GenericEventSource::from_response(client, req, response)
+                .allow_missing_content_type();
 
         Ok(responses_api::streaming::raw_stream_from_event_source(
             event_source,
@@ -736,6 +766,238 @@ fn merge_instructions(default_instructions: &str, existing_instructions: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    mod streaming_token_recovery {
+        use super::*;
+        use crate::http_client::{LazyBody, MultipartForm, Request, Response, StreamingResponse};
+        use crate::wasm_compat::WasmCompatSend;
+        use bytes::Bytes;
+        use std::future::{self, Future};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::Barrier;
+
+        const SSE_BODY: &str = "data: [DONE]\n\n";
+
+        #[derive(Clone, Debug)]
+        struct RotatingStreamingClient {
+            auth_file: PathBuf,
+            old_token_barrier: Option<Arc<Barrier>>,
+            rotated: Arc<AtomicBool>,
+            requests: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl Default for RotatingStreamingClient {
+            fn default() -> Self {
+                Self {
+                    auth_file: PathBuf::new(),
+                    old_token_barrier: None,
+                    rotated: Arc::new(AtomicBool::new(false)),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+        }
+
+        impl RotatingStreamingClient {
+            fn new(auth_file: PathBuf, concurrent_old_requests: usize) -> Self {
+                Self {
+                    auth_file,
+                    old_token_barrier: (concurrent_old_requests > 1)
+                        .then(|| Arc::new(Barrier::new(concurrent_old_requests))),
+                    rotated: Arc::new(AtomicBool::new(false)),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn authorizations(&self) -> Vec<String> {
+                self.requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            }
+        }
+
+        impl HttpClientExt for RotatingStreamingClient {
+            fn send<T, U>(
+                &self,
+                _req: Request<T>,
+            ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>>
+            + WasmCompatSend
+            + 'static
+            where
+                T: Into<Bytes> + WasmCompatSend,
+                U: From<Bytes> + WasmCompatSend + 'static,
+            {
+                future::ready(Err(http_client::Error::InvalidStatusCode(
+                    http::StatusCode::NOT_IMPLEMENTED,
+                )))
+            }
+
+            fn send_multipart<U>(
+                &self,
+                _req: Request<MultipartForm>,
+            ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>>
+            + WasmCompatSend
+            + 'static
+            where
+                U: From<Bytes> + WasmCompatSend + 'static,
+            {
+                future::ready(Err(http_client::Error::InvalidStatusCode(
+                    http::StatusCode::NOT_IMPLEMENTED,
+                )))
+            }
+
+            fn send_streaming<T>(
+                &self,
+                req: Request<T>,
+            ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+            where
+                T: Into<Bytes> + WasmCompatSend,
+            {
+                let authorization = req
+                    .headers()
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                self.requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(authorization.clone());
+                let auth_file = self.auth_file.clone();
+                let barrier = self.old_token_barrier.clone();
+                let rotated = self.rotated.clone();
+
+                async move {
+                    if authorization == "Bearer old-access" {
+                        if let Some(barrier) = barrier {
+                            barrier.wait().await;
+                        }
+                        if !rotated.swap(true, Ordering::AcqRel) {
+                            std::fs::write(
+                                auth_file,
+                                serde_json::to_vec_pretty(&serde_json::json!({
+                                    "access_token": "new-access",
+                                    "refresh_token": "new-refresh",
+                                    "expires_at": i64::MAX,
+                                }))
+                                .expect("serialize rotated credential"),
+                            )
+                            .expect("persist rotated credential");
+                        }
+                        return Err(http_client::Error::InvalidStatusCodeWithMessage(
+                            http::StatusCode::UNAUTHORIZED,
+                            r#"{"error":{"code":"token_expired"}}"#.to_string(),
+                        ));
+                    }
+
+                    let stream = futures::stream::iter([Ok::<Bytes, http_client::Error>(
+                        Bytes::from_static(SSE_BODY.as_bytes()),
+                    )]);
+                    Response::builder()
+                        .status(http::StatusCode::OK)
+                        .header(http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(Box::pin(stream) as crate::http_client::sse::BoxedStream)
+                        .map_err(http_client::Error::Protocol)
+                }
+            }
+        }
+
+        fn seed_auth(auth_file: &Path) {
+            std::fs::write(
+                auth_file,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "expires_at": i64::MAX,
+                }))
+                .expect("serialize seed credential"),
+            )
+            .expect("write seed credential");
+        }
+
+        fn model(
+            auth_file: &Path,
+            http_client: RotatingStreamingClient,
+        ) -> ResponsesCompletionModel<RotatingStreamingClient> {
+            let client = crate::providers::chatgpt::Client::builder()
+                .oauth()
+                .auth_file(auth_file)
+                .allow_device_flow(false)
+                .http_client(http_client)
+                .build()
+                .expect("build ChatGPT client");
+            ResponsesCompletionModel::new(client, GPT_5_4)
+        }
+
+        fn request() -> completion::CompletionRequest {
+            completion::CompletionRequest {
+                model: None,
+                preamble: None,
+                chat_history: vec![completion::Message::user("hello")],
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                tool_choice: None,
+                additional_params: None,
+                output_schema: None,
+                record_telemetry_content: false,
+            }
+        }
+
+        #[tokio::test]
+        async fn raw_stream_replays_once_with_rotated_credential() {
+            let temp = assert_fs::TempDir::new().expect("temp auth directory");
+            let auth_file = temp.path().join("auth.json");
+            seed_auth(&auth_file);
+            let http_client = RotatingStreamingClient::new(auth_file.clone(), 1);
+            let model = model(&auth_file, http_client.clone());
+
+            let _stream = model
+                .raw_stream(request())
+                .await
+                .expect("token-expired stream should replay");
+
+            assert_eq!(
+                http_client.authorizations(),
+                ["Bearer old-access", "Bearer new-access"]
+            );
+        }
+
+        #[tokio::test]
+        async fn concurrent_streams_reuse_one_rotated_credential() {
+            let temp = assert_fs::TempDir::new().expect("temp auth directory");
+            let auth_file = temp.path().join("auth.json");
+            seed_auth(&auth_file);
+            let http_client = RotatingStreamingClient::new(auth_file.clone(), 2);
+            let first = model(&auth_file, http_client.clone());
+            let second = model(&auth_file, http_client.clone());
+
+            let (first_result, second_result) =
+                tokio::join!(first.raw_stream(request()), second.raw_stream(request()));
+            let _first_stream = first_result.expect("first stream should recover");
+            let _second_stream = second_result.expect("second stream should recover");
+
+            let authorizations = http_client.authorizations();
+            assert_eq!(
+                authorizations
+                    .iter()
+                    .filter(|header| header.as_str() == "Bearer old-access")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                authorizations
+                    .iter()
+                    .filter(|header| header.as_str() == "Bearer new-access")
+                    .count(),
+                2
+            );
+            assert_eq!(authorizations.len(), 4, "each stream replays at most once");
+        }
+    }
 
     #[test]
     fn only_explicit_expired_token_unauthorized_is_replayable() {
