@@ -17,6 +17,7 @@
 //! ```
 
 mod auth;
+mod wire;
 
 use crate::client::{self, ApiKey, DebugExt, Provider, ProviderBuilder, ProviderClient, Transport};
 use crate::completion::{self, CompletionError, NormalizeCompletionResponse};
@@ -499,7 +500,7 @@ where
         request: ResponsesRequest,
     ) -> Result<(responses_api::CompletionResponse, String), CompletionError> {
         let body = serde_json::to_vec(&request)?;
-        let auth = self
+        let mut auth = self
             .client
             .ext()
             .auth
@@ -507,14 +508,17 @@ where
             .await
             .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
 
-        let req = self
-            .add_auth_headers(self.client.post("/responses")?, &auth)
-            .body(body)
-            .map_err(|err| CompletionError::HttpError(err.into()))?;
-
-        let response = self.client.send(req).await?;
-        let status = response.status();
-        let text = http_client::text(response).await?;
+        let (mut status, mut text) = self.send_completion_once(&body, &auth).await?;
+        if wire::is_expired_token_response(status, &text) {
+            auth = self
+                .client
+                .ext()
+                .auth
+                .refresh_after_rejection(&auth)
+                .await
+                .map_err(|err| CompletionError::ProviderError(err.to_string()))?;
+            (status, text) = self.send_completion_once(&body, &auth).await?;
+        }
         if !status.is_success() {
             return Err(CompletionError::from_http_response(status, text));
         }
@@ -528,6 +532,21 @@ where
         span.record_response_metadata(&raw_response);
 
         Ok((raw_response, text))
+    }
+
+    async fn send_completion_once(
+        &self,
+        body: &[u8],
+        auth: &auth::AuthContext,
+    ) -> Result<(http::StatusCode, String), CompletionError> {
+        let request = self
+            .add_auth_headers(self.client.post("/responses")?, auth)
+            .body(body.to_vec())
+            .map_err(|error| CompletionError::HttpError(error.into()))?;
+        let response = self.client.send(request).await?;
+        let status = response.status();
+        let text = http_client::text(response).await?;
+        Ok((status, text))
     }
 
     /// Normalize a ChatGPT completion, falling back to the SSE event stream
@@ -717,6 +736,30 @@ fn merge_instructions(default_instructions: &str, existing_instructions: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_expired_token_unauthorized_is_replayable() {
+        assert!(wire::is_expired_token_response(
+            http::StatusCode::UNAUTHORIZED,
+            r#"{"code":"token_expired","message":"expired"}"#,
+        ));
+        assert!(wire::is_expired_token_response(
+            http::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"code":"token_expired"}}"#,
+        ));
+        assert!(!wire::is_expired_token_response(
+            http::StatusCode::UNAUTHORIZED,
+            r#"{"code":"account_deactivated"}"#,
+        ));
+        assert!(!wire::is_expired_token_response(
+            http::StatusCode::FORBIDDEN,
+            r#"{"code":"token_expired"}"#,
+        ));
+        assert!(!wire::is_expired_token_response(
+            http::StatusCode::UNAUTHORIZED,
+            "not json",
+        ));
+    }
 
     #[test]
     fn test_parse_chatgpt_sse_completion() {

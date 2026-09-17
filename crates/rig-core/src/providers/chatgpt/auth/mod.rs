@@ -1,8 +1,9 @@
 //! Shared ChatGPT authentication types and target-specific dispatch.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use tokio::sync::Mutex;
 
 pub use crate::providers::internal::auth::{DeviceCodeHandler, DeviceCodePrompt};
@@ -67,6 +68,7 @@ impl Authenticator {
         device_code_handler: DeviceCodeHandler,
         allow_device_flow: bool,
     ) -> Self {
+        let state_lock = shared_state_lock(auth_file.as_deref());
         Self {
             source,
             platform: platform::PlatformAuthenticator::new(
@@ -75,7 +77,7 @@ impl Authenticator {
                 device_code_handler,
                 allow_device_flow,
             ),
-            state_lock: Arc::new(Mutex::new(())),
+            state_lock,
         }
     }
 
@@ -93,5 +95,59 @@ impl Authenticator {
                 self.platform.auth_context_oauth().await
             }
         }
+    }
+
+    pub async fn refresh_after_rejection(
+        &self,
+        rejected: &AuthContext,
+    ) -> Result<AuthContext, AuthError> {
+        match &self.source {
+            AuthSource::AccessToken { .. } => Err(AuthError::Message(
+                "ChatGPT access token was rejected and cannot be refreshed".into(),
+            )),
+            AuthSource::OAuth => {
+                let _guard = self.state_lock.lock().await;
+                self.platform
+                    .refresh_after_rejection(&rejected.access_token)
+                    .await
+            }
+        }
+    }
+}
+
+fn shared_state_lock(auth_file: Option<&Path>) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
+    let Some(path) = auth_file else {
+        return Arc::new(Mutex::new(()));
+    };
+    let locks = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shared_state_lock;
+    use std::sync::Arc;
+
+    #[test]
+    fn clients_for_one_auth_file_share_the_refresh_lock() {
+        let path = std::path::Path::new("/tmp/rig-chatgpt-shared-auth.json");
+        let first = shared_state_lock(Some(path));
+        let second = shared_state_lock(Some(path));
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let other = shared_state_lock(Some(std::path::Path::new(
+            "/tmp/rig-chatgpt-other-auth.json",
+        )));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 }

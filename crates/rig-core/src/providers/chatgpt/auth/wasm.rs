@@ -21,4 +21,13 @@ impl PlatformAuthenticator {
             "ChatGPT OAuth is not supported on wasm targets".into(),
         ))
     }
+
+    pub(super) async fn refresh_after_rejection(
+        &self,
+        _rejected_access_token: &str,
+    ) -> Result<AuthContext, AuthError> {
+        Err(AuthError::Message(
+            "ChatGPT OAuth is not supported on wasm targets".into(),
+        ))
+    }
 }
