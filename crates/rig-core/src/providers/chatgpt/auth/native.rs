@@ -65,8 +65,36 @@ struct OAuthTokenResponse {
 
 #[derive(Debug, Deserialize)]
 struct OAuthErrorResponse {
-    error: Option<String>,
+    error: Option<OAuthError>,
     error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OAuthError {
+    Code(String),
+    Details {
+        code: Option<String>,
+        message: Option<String>,
+    },
+}
+
+impl OAuthErrorResponse {
+    fn code(&self) -> Option<&str> {
+        match self.error.as_ref()? {
+            OAuthError::Code(code) => Some(code),
+            OAuthError::Details { code, .. } => code.as_deref(),
+        }
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.error_description
+            .as_deref()
+            .or_else(|| match self.error.as_ref()? {
+                OAuthError::Details { message, .. } => message.as_deref(),
+                OAuthError::Code(_) => None,
+            })
+    }
 }
 
 enum RefreshTokensError {
@@ -406,9 +434,7 @@ impl PlatformAuthenticator {
         let oauth_error = serde_json::from_str::<OAuthErrorResponse>(&body).ok();
         if should_reauthenticate_after_refresh(
             status,
-            oauth_error
-                .as_ref()
-                .and_then(|error| error.error.as_deref()),
+            oauth_error.as_ref().and_then(OAuthErrorResponse::code),
         ) {
             return Err(RefreshTokensError::Reauthenticate);
         }
@@ -534,6 +560,10 @@ fn should_reauthenticate_after_refresh(
         status,
         reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED
     ) && matches!(error_code, Some("invalid_grant"))
+        // The refresh endpoint also returns OpenAI's nested error envelope for
+        // credentials it cannot validate. Do not broaden this to generic 401s.
+        || (status == reqwest::StatusCode::UNAUTHORIZED
+            && error_code == Some("token_expired"))
 }
 
 fn format_refresh_error(
@@ -541,8 +571,8 @@ fn format_refresh_error(
     oauth_error: Option<&OAuthErrorResponse>,
     body: &str,
 ) -> String {
-    let error_code = oauth_error.and_then(|error| error.error.as_deref());
-    let description = oauth_error.and_then(|error| error.error_description.as_deref());
+    let error_code = oauth_error.and_then(OAuthErrorResponse::code);
+    let description = oauth_error.and_then(OAuthErrorResponse::description);
 
     if let Some(description) = description
         .map(str::trim)
@@ -735,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_reauth_only_on_invalid_grant() {
+    fn refresh_reauth_only_on_terminal_credential_errors() {
         assert!(should_reauthenticate_after_refresh(
             StatusCode::BAD_REQUEST,
             Some("invalid_grant")
@@ -842,7 +872,7 @@ mod tests {
     #[test]
     fn refresh_error_uses_oauth_description_when_present() {
         let oauth_error = OAuthErrorResponse {
-            error: Some("temporarily_unavailable".into()),
+            error: Some(super::OAuthError::Code("temporarily_unavailable".into())),
             error_description: Some("please retry".into()),
         };
 
@@ -958,6 +988,114 @@ mod tests {
         assert!(persisted["access_token"].is_null());
         assert!(persisted["refresh_token"].is_null());
         assert!(!persisted.to_string().contains("refresh-secret"));
+    }
+
+    // Replay the real OAuth refresh response observed in native Mem acceptance.
+    // This private auth seam also verifies credential persistence, outside completion cassettes.
+    #[tokio::test]
+    async fn nested_token_expired_persists_reauthentication_state() {
+        let temp = assert_fs::TempDir::new().expect("temp auth directory");
+        let auth_file = temp.path().join("auth.json");
+        let old_access = jwt_with_exp(i64::MAX);
+        std::fs::write(
+            &auth_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "access_token": old_access,
+                "refresh_token": "refresh-secret",
+                "expires_at": i64::MAX,
+            }))
+            .expect("serialize seed auth"),
+        )
+        .expect("write seed auth");
+        let (endpoint, server) = one_response_server(
+            "401 Unauthorized",
+            serde_json::json!({"error": {
+                "message": "Could not validate your token. Please try signing in again.",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "token_expired"
+            }})
+            .to_string(),
+        )
+        .await;
+        let auth = PlatformAuthenticator::new(
+            Some(auth_file.clone()),
+            Some(reqwest::Client::new()),
+            DeviceCodeHandler::default(),
+            false,
+        );
+
+        let error = auth
+            .refresh_after_rejection_at(&endpoint, &old_access)
+            .await
+            .expect_err("expired refresh credential requires sign-in")
+            .to_string();
+        server.await.expect("fixture server exits");
+        assert!(error.contains("ChatGPT sign-in required"), "{error}");
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_file).expect("read terminal auth state"))
+                .expect("parse terminal auth state");
+        assert_eq!(persisted["reauth_required"], true);
+        assert!(persisted["access_token"].is_null());
+        assert!(persisted["refresh_token"].is_null());
+        assert!(!persisted.to_string().contains("refresh-secret"));
+    }
+
+    // Exercise the private OAuth HTTP seam: completion cassettes do not cover refresh.
+    #[tokio::test]
+    async fn nonterminal_refresh_responses_preserve_credentials() {
+        for (status, body) in [
+            (
+                "401 Unauthorized",
+                r#"{"error":{"code":"invalid_request_error"}}"#,
+            ),
+            (
+                "401 Unauthorized",
+                r#"{"error":{"message":"token_expired"}}"#,
+            ),
+            ("401 Unauthorized", "<html>Access denied</html>"),
+            ("403 Forbidden", r#"{"error":{"code":"token_expired"}}"#),
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"code":"token_expired"}}"#,
+            ),
+            ("502 Bad Gateway", r#"{"error":{"code":"token_expired"}}"#),
+            ("400 Bad Request", r#"{"error":{"code":"token_expired"}}"#),
+        ] {
+            let temp = assert_fs::TempDir::new().expect("temp auth directory");
+            let auth_file = temp.path().join("auth.json");
+            let access = jwt_with_exp(i64::MAX);
+            let seed = serde_json::to_vec(&serde_json::json!({
+                "access_token": access,
+                "refresh_token": "valid-refresh",
+                "expires_at": i64::MAX,
+            }))
+            .expect("serialize auth");
+            std::fs::write(&auth_file, &seed).expect("seed auth");
+            let (endpoint, server) = one_response_server(status, body.into()).await;
+            let auth = PlatformAuthenticator::new(
+                Some(auth_file.clone()),
+                Some(reqwest::Client::new()),
+                DeviceCodeHandler::default(),
+                false,
+            );
+            let error = auth
+                .refresh_after_rejection_at(&endpoint, &access)
+                .await
+                .expect_err("nonterminal failure must surface")
+                .to_string();
+            server.await.expect("fixture exits");
+            assert!(
+                !error.contains("ChatGPT sign-in required"),
+                "{status}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&auth_file).expect("read auth"),
+                seed,
+                "{status}"
+            );
+        }
     }
 
     #[test]
