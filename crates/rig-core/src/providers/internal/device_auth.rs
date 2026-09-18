@@ -70,6 +70,79 @@ pub(crate) fn write_json_record<T: Serialize>(
     };
 
     ensure_parent_dir(path)?;
-    std::fs::write(path, serde_json::to_vec_pretty(record)?)?;
+    let data = serde_json::to_vec_pretty(record)?;
+    write_private_record(path, &data)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_record(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut random = [0_u8; 12];
+    getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("auth.json");
+    let temporary = path.with_file_name(format!(".{file_name}.{suffix}.tmp"));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_private_record(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    // Windows applies ACLs inherited from the per-user config directory. Its
+    // rename primitive does not atomically replace an existing file, so retain
+    // the previous overwrite behavior instead of adding a delete gap.
+    std::fs::write(path, data)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::write_json_record;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn auth_records_are_replaced_atomically_with_private_permissions() {
+        let temp = assert_fs::TempDir::new().expect("temp auth directory");
+        let path = temp.path().join("nested/auth.json");
+
+        write_json_record(Some(&path), &serde_json::json!({"token": "first"}))
+            .expect("first auth write");
+        write_json_record(Some(&path), &serde_json::json!({"token": "second"}))
+            .expect("replacement auth write");
+
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read auth record"))
+                .expect("parse auth record");
+        assert_eq!(stored["token"], "second");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("auth metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 }

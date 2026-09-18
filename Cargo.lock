@@ -9933,6 +9933,7 @@ dependencies = [
  "fastrand",
  "futures",
  "futures-timer",
+ "getrandom 0.3.4",
  "glob",
  "http 1.4.2",
  "indexmap 2.14.0",

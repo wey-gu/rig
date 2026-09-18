@@ -7,7 +7,9 @@ use crate::providers::internal::device_auth::{
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const CHATGPT_AUTH_BASE: &str = "https://auth.openai.com";
 const CHATGPT_DEVICE_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -15,6 +17,15 @@ const CHATGPT_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/dev
 const CHATGPT_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CHATGPT_DEVICE_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CHATGPT_BROWSER_CALLBACK_HOST: &str = "127.0.0.1";
+const CHATGPT_BROWSER_CALLBACK_PORTS: [u16; 2] = [1455, 1457];
+const CHATGPT_BROWSER_CALLBACK_PATH: &str = "/auth/callback";
+const CHATGPT_BROWSER_SCOPE: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const CHATGPT_BROWSER_ORIGINATOR: &str = "codex_cli_rs";
+const CHATGPT_BROWSER_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const CHATGPT_BROWSER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const CHATGPT_BROWSER_MAX_HEADER_BYTES: usize = 8192;
 const TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
 const DEVICE_CODE_TIMEOUT_SECONDS: i64 = 15 * 60;
 const DEVICE_CODE_POLL_SLEEP_SECONDS: u64 = 5;
@@ -147,12 +158,45 @@ impl PlatformAuthenticator {
     }
 
     pub(super) async fn login_device_flow(&self) -> Result<AuthRecord, AuthError> {
-        self.login_device_flow_at(
+        self.login_with_fallback_at(
             CHATGPT_DEVICE_CODE_URL,
             CHATGPT_DEVICE_TOKEN_URL,
             CHATGPT_OAUTH_TOKEN_URL,
+            CHATGPT_AUTH_BASE,
+            CHATGPT_OAUTH_TOKEN_URL,
+            &CHATGPT_BROWSER_CALLBACK_PORTS,
         )
         .await
+    }
+
+    async fn login_with_fallback_at(
+        &self,
+        device_code_url: &str,
+        device_token_url: &str,
+        device_oauth_token_url: &str,
+        browser_issuer: &str,
+        browser_oauth_token_url: &str,
+        browser_callback_ports: &[u16],
+    ) -> Result<AuthRecord, AuthError> {
+        match self
+            .login_device_flow_at(device_code_url, device_token_url, device_oauth_token_url)
+            .await
+        {
+            Ok(record) => Ok(record),
+            Err(device_error) if browser_fallback_candidate(&device_error) => self
+                .login_browser_flow_at(
+                    browser_issuer,
+                    browser_oauth_token_url,
+                    browser_callback_ports,
+                )
+                .await
+                .map_err(|browser_error| {
+                    AuthError::Message(format!(
+                        "{device_error} Browser sign-in fallback also failed: {browser_error}"
+                    ))
+                }),
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) fn persist_device_flow(&self, fresh: AuthRecord) -> Result<AuthContext, AuthError> {
@@ -355,6 +399,73 @@ impl PlatformAuthenticator {
         Ok(build_auth_record(tokens, None))
     }
 
+    async fn login_browser_flow_at(
+        &self,
+        issuer: &str,
+        oauth_token_url: &str,
+        callback_ports: &[u16],
+    ) -> Result<AuthRecord, AuthError> {
+        let http_client = self
+            .http_client
+            .as_ref()
+            .map_err(|error| AuthError::Message(error.clone()))?;
+        let verifier = random_urlsafe(64)?;
+        let challenge = pkce_challenge(&verifier);
+        let state = random_urlsafe(32)?;
+        let listener = bind_browser_callback_listener(callback_ports).await?;
+        let port = listener.local_addr()?.port();
+        let redirect_uri = format!("http://localhost:{port}{CHATGPT_BROWSER_CALLBACK_PATH}");
+        let authorize_url = build_browser_authorize_url(issuer, &redirect_uri, &challenge, &state);
+        emit_device_code_prompt(
+            self.device_code_handler.0.as_ref(),
+            DeviceCodePrompt {
+                verification_uri: authorize_url.clone(),
+                user_code: String::new(),
+            },
+            &format!("Open {authorize_url} to sign in with ChatGPT."),
+        );
+
+        let code = wait_for_browser_callback(listener, &state).await?;
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", redirect_uri.as_str()),
+                ("client_id", CHATGPT_CLIENT_ID),
+                ("code_verifier", verifier.as_str()),
+            ])
+            .finish();
+        let response = http_client
+            .post(oauth_token_url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| auth_request_error("browser token exchange", error))?;
+        let status = response.status();
+        if !status.is_success() {
+            let payload = response.json::<OAuthErrorResponse>().await.ok();
+            return Err(AuthError::Message(format_browser_token_error(
+                status,
+                payload.as_ref(),
+            )));
+        }
+        let tokens = response.json::<OAuthTokenResponse>().await?;
+        if tokens
+            .refresh_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(AuthError::Message(
+                "ChatGPT browser token exchange did not return a refresh token".into(),
+            ));
+        }
+        Ok(build_auth_record(tokens, None))
+    }
+
     async fn refresh_tokens(&self, refresh_token: &str) -> Result<AuthRecord, RefreshTokensError> {
         self.refresh_tokens_at(CHATGPT_OAUTH_TOKEN_URL, refresh_token)
             .await
@@ -416,6 +527,274 @@ impl PlatformAuthenticator {
         Err(RefreshTokensError::Auth(AuthError::Message(
             format_refresh_error(status, oauth_error.as_ref(), &body),
         )))
+    }
+}
+
+fn browser_fallback_candidate(error: &AuthError) -> bool {
+    let message = error.to_string();
+    message.contains("device-code sign-in was blocked by a network security challenge")
+        || message.contains("denied the ChatGPT device-code request before sign-in began")
+}
+
+async fn bind_browser_callback_listener(
+    callback_ports: &[u16],
+) -> Result<tokio::net::TcpListener, AuthError> {
+    let mut failures = Vec::new();
+    for port in callback_ports {
+        match tokio::net::TcpListener::bind((CHATGPT_BROWSER_CALLBACK_HOST, *port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => failures.push(format!("{port}: {error}")),
+        }
+    }
+    Err(AuthError::Message(format!(
+        "ChatGPT browser callback could not bind a registered loopback port ({})",
+        failures.join("; ")
+    )))
+}
+
+async fn wait_for_browser_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<String, AuthError> {
+    tokio::time::timeout(CHATGPT_BROWSER_CALLBACK_TIMEOUT, async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let accepted = if connections.is_empty() {
+                Some(listener.accept().await)
+            } else {
+                match futures::future::select(
+                    Box::pin(listener.accept()),
+                    Box::pin(connections.join_next()),
+                )
+                .await
+                {
+                    futures::future::Either::Left((accepted, _)) => Some(accepted),
+                    futures::future::Either::Right((completed, _)) => {
+                        match completed {
+                            Some(Ok(Some(Ok(code)))) => return Ok(code),
+                            Some(Ok(Some(Err(error)))) => return Err(error),
+                            Some(Ok(None) | Err(_)) | None => {}
+                        }
+                        None
+                    }
+                }
+            };
+
+            let Some(accepted) = accepted else {
+                continue;
+            };
+            let (mut stream, peer) = accepted?;
+            if !peer.ip().is_loopback() {
+                write_browser_callback_response(&mut stream, 403, "Forbidden").await;
+                continue;
+            }
+            let expected_state = expected_state.to_string();
+            connections.spawn(async move {
+                handle_browser_callback_connection(&mut stream, &expected_state).await
+            });
+        }
+    })
+    .await
+    .map_err(|_| AuthError::Message("Timed out waiting for ChatGPT browser sign-in".into()))?
+}
+
+async fn handle_browser_callback_connection(
+    stream: &mut tokio::net::TcpStream,
+    expected_state: &str,
+) -> Option<Result<String, AuthError>> {
+    match tokio::time::timeout(
+        CHATGPT_BROWSER_CONNECTION_TIMEOUT,
+        handle_browser_callback_connection_inner(stream, expected_state),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                write_browser_callback_response(stream, 408, "Callback request timed out"),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+async fn handle_browser_callback_connection_inner(
+    stream: &mut tokio::net::TcpStream,
+    expected_state: &str,
+) -> Option<Result<String, AuthError>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut request = Vec::with_capacity(1024);
+    loop {
+        if request.len() >= CHATGPT_BROWSER_MAX_HEADER_BYTES {
+            write_browser_callback_response(stream, 431, "Callback request headers are too large")
+                .await;
+            return None;
+        }
+        let remaining = CHATGPT_BROWSER_MAX_HEADER_BYTES - request.len();
+        let mut chunk = [0_u8; 1024];
+        let read_limit = remaining.min(chunk.len());
+        let read_buffer = chunk.get_mut(..read_limit)?;
+        let count = match stream.read(read_buffer).await {
+            Ok(count) => count,
+            Err(_) => return None,
+        };
+        if count == 0 {
+            write_browser_callback_response(stream, 400, "Incomplete callback request").await;
+            return None;
+        }
+        let bytes = chunk.get(..count)?;
+        request.extend_from_slice(bytes);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let Some(first_line_end) = request.windows(2).position(|window| window == b"\r\n") else {
+        write_browser_callback_response(stream, 400, "Invalid callback").await;
+        return None;
+    };
+    let first_line_bytes = request.get(..first_line_end)?;
+    let Ok(first_line) = std::str::from_utf8(first_line_bytes) else {
+        write_browser_callback_response(stream, 400, "Invalid callback").await;
+        return None;
+    };
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if method != "GET" {
+        write_browser_callback_response(stream, 405, "Method not allowed").await;
+        return None;
+    }
+    let Ok(url) = url::Url::parse(&format!("http://{CHATGPT_BROWSER_CALLBACK_HOST}{target}"))
+    else {
+        write_browser_callback_response(stream, 400, "Invalid callback").await;
+        return None;
+    };
+    if url.path() != CHATGPT_BROWSER_CALLBACK_PATH {
+        write_browser_callback_response(stream, 404, "Not found").await;
+        return None;
+    }
+    let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    if params.get("state").map(String::as_str) != Some(expected_state) {
+        write_browser_callback_response(stream, 400, "Sign-in state mismatch").await;
+        return None;
+    }
+    if let Some(error) = params.get("error") {
+        write_browser_callback_response(
+            stream,
+            400,
+            "ChatGPT sign-in was not completed. You can close this tab.",
+        )
+        .await;
+        let description = params
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or(error);
+        return Some(Err(AuthError::Message(format!(
+            "ChatGPT browser authorization failed: {description}"
+        ))));
+    }
+    let Some(code) = params
+        .get("code")
+        .filter(|code| !code.trim().is_empty())
+        .cloned()
+    else {
+        write_browser_callback_response(stream, 400, "Missing authorization code").await;
+        return None;
+    };
+    write_browser_callback_response(
+        stream,
+        200,
+        "ChatGPT sign-in received. You can close this tab and return to Nowledge Mem.",
+    )
+    .await;
+    Some(Ok(code))
+}
+
+async fn write_browser_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    message: &str,
+) {
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        431 => "Request Header Fields Too Large",
+        _ => "OK",
+    };
+    let body = format!("<html><body><h1>{message}</h1></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await;
+    let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
+}
+
+fn build_browser_authorize_url(
+    issuer: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("response_type", "code")
+        .append_pair("client_id", CHATGPT_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", CHATGPT_BROWSER_SCOPE)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("state", state)
+        .append_pair("originator", CHATGPT_BROWSER_ORIGINATOR);
+    format!(
+        "{}/oauth/authorize?{}",
+        issuer.trim_end_matches('/'),
+        query.finish()
+    )
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::Digest as _;
+    BASE64_URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()))
+}
+
+fn random_urlsafe(length: usize) -> Result<String, AuthError> {
+    let mut bytes = vec![0_u8; length];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| AuthError::Message(format!("secure random generation failed: {error}")))?;
+    Ok(BASE64_URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn format_browser_token_error(
+    status: reqwest::StatusCode,
+    error: Option<&OAuthErrorResponse>,
+) -> String {
+    let code = error
+        .and_then(|error| error.error.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let description = error
+        .and_then(|error| error.error_description.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (code, description) {
+        (Some(code), Some(description)) => {
+            format!("ChatGPT browser token exchange failed: {status} {code} ({description})")
+        }
+        (Some(code), None) => {
+            format!("ChatGPT browser token exchange failed: {status} {code}")
+        }
+        _ => format!("ChatGPT browser token exchange failed: {status}"),
     }
 }
 
@@ -598,10 +977,12 @@ where
 mod tests {
     use super::{
         DeviceCodeHandler, DeviceCodeResponse, OAuthErrorResponse, OAuthTokenResponse,
-        PlatformAuthenticator, RefreshTokensError, build_auth_record, device_code_request_error,
-        format_refresh_error, should_reauthenticate_after_refresh,
+        PlatformAuthenticator, RefreshTokensError, build_auth_record, build_browser_authorize_url,
+        device_code_request_error, format_browser_token_error, format_refresh_error,
+        should_reauthenticate_after_refresh, wait_for_browser_callback,
     };
     use reqwest::StatusCode;
+    use std::time::Duration;
 
     fn jwt_with_exp(exp: i64) -> String {
         use base64::Engine as _;
@@ -687,6 +1068,263 @@ mod tests {
         assert!(upstream.contains("temporarily unavailable"), "{upstream}");
     }
 
+    #[test]
+    fn browser_authorize_url_matches_first_party_pkce_contract() {
+        let url = url::Url::parse(&build_browser_authorize_url(
+            "https://auth.openai.com/",
+            "http://localhost:1455/auth/callback",
+            "challenge-value",
+            "state-value",
+        ))
+        .expect("valid authorize URL");
+        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            url.as_str().split('?').next(),
+            Some("https://auth.openai.com/oauth/authorize")
+        );
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("app_EMoamEEZ73f0CkXaXp7hrann")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some("http://localhost:1455/auth/callback")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            params.get("id_token_add_organizations").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            params.get("codex_cli_simplified_flow").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            params.get("originator").map(String::as_str),
+            Some("codex_cli_rs")
+        );
+        assert_eq!(params.get("state").map(String::as_str), Some("state-value"));
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some("challenge-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_callback_rejects_wrong_state_without_consuming_attempt() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback fixture");
+        let address = listener.local_addr().expect("callback address");
+        let callback =
+            tokio::spawn(
+                async move { wait_for_browser_callback(listener, "expected-state").await },
+            );
+
+        let mut wrong = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect wrong-state callback");
+        wrong
+            .write_all(
+                b"GET /auth/callback?state=wrong&code=must-not-win HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("send wrong callback");
+        let mut wrong_response = String::new();
+        wrong
+            .read_to_string(&mut wrong_response)
+            .await
+            .expect("read wrong-state response");
+        assert!(
+            wrong_response.starts_with("HTTP/1.1 400"),
+            "{wrong_response}"
+        );
+
+        let mut valid = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect valid callback");
+        valid
+            .write_all(
+                b"GET /auth/callback?state=expected-state&code=authorization-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("send valid callback");
+        let mut valid_response = String::new();
+        valid
+            .read_to_string(&mut valid_response)
+            .await
+            .expect("read valid response");
+        assert!(
+            valid_response.starts_with("HTTP/1.1 200"),
+            "{valid_response}"
+        );
+
+        assert_eq!(
+            callback
+                .await
+                .expect("callback task")
+                .expect("valid callback"),
+            "authorization-code"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_loopback_connection_cannot_block_a_valid_callback() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback fixture");
+        let address = listener.local_addr().expect("callback address");
+        let callback =
+            tokio::spawn(
+                async move { wait_for_browser_callback(listener, "expected-state").await },
+            );
+
+        let _idle = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect idle socket");
+        tokio::task::yield_now().await;
+        let mut valid = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect valid callback");
+        valid
+            .write_all(
+                b"GET /auth/callback?state=expected-state&code=valid-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("send valid callback");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(300), callback)
+                .await
+                .expect("idle connection must not block valid callback")
+                .expect("callback task")
+                .expect("valid callback"),
+            "valid-code"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_browser_callback_wait_releases_the_registered_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback fixture");
+        let address = listener.local_addr().expect("callback address");
+        let callback =
+            tokio::spawn(async move { wait_for_browser_callback(listener, "state").await });
+
+        callback.abort();
+        let cancelled = callback.await.expect_err("callback wait must be cancelled");
+        assert!(cancelled.is_cancelled());
+
+        let rebound = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("cancelled callback wait must release its loopback port");
+        assert_eq!(rebound.local_addr().expect("rebound address"), address);
+    }
+
+    #[tokio::test]
+    async fn fragmented_state_waits_for_complete_http_headers() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback fixture");
+        let address = listener.local_addr().expect("callback address");
+        let callback =
+            tokio::spawn(
+                async move { wait_for_browser_callback(listener, "expected-state").await },
+            );
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect callback");
+        stream
+            .write_all(b"GET /auth/callback?sta")
+            .await
+            .expect("write first fragment");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !callback.is_finished(),
+            "partial state consumed the attempt"
+        );
+        stream
+            .write_all(
+                b"te=expected-state&code=fragmented-code HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("write remaining callback");
+
+        assert_eq!(
+            callback
+                .await
+                .expect("callback task")
+                .expect("valid fragmented callback"),
+            "fragmented-code"
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_code_is_not_consumed_before_request_completion() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback fixture");
+        let address = listener.local_addr().expect("callback address");
+        let callback =
+            tokio::spawn(
+                async move { wait_for_browser_callback(listener, "expected-state").await },
+            );
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect callback");
+        stream
+            .write_all(b"GET /auth/callback?state=expected-state&code=partial")
+            .await
+            .expect("write first fragment");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!callback.is_finished(), "partial code consumed the attempt");
+        stream
+            .write_all(b"-complete HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write remaining callback");
+
+        assert_eq!(
+            callback
+                .await
+                .expect("callback task")
+                .expect("valid fragmented callback"),
+            "partial-complete"
+        );
+    }
+
+    #[test]
+    fn browser_token_error_does_not_echo_unparsed_payload() {
+        assert_eq!(
+            format_browser_token_error(StatusCode::BAD_GATEWAY, None),
+            "ChatGPT browser token exchange failed: 502 Bad Gateway"
+        );
+        let parsed = OAuthErrorResponse {
+            error: Some("access_denied".into()),
+            error_description: Some("workspace access is unavailable".into()),
+        };
+        assert_eq!(
+            format_browser_token_error(StatusCode::FORBIDDEN, Some(&parsed)),
+            "ChatGPT browser token exchange failed: 403 Forbidden access_denied (workspace access is unavailable)"
+        );
+    }
+
     #[tokio::test]
     async fn cloudflare_device_code_challenge_is_classified_without_echoing_body() {
         use tokio::io::AsyncWriteExt;
@@ -732,6 +1370,129 @@ mod tests {
             !error.contains(secret_body),
             "upstream response body leaked: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_device_denial_falls_back_to_browser_pkce_and_returns_refreshable_auth() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OAuth fixture");
+        let address = listener.local_addr().expect("OAuth fixture address");
+        let access_token = jwt_with_exp(i64::MAX - 2);
+        let token_body = serde_json::json!({
+            "access_token": access_token,
+            "refresh_token": "refresh-from-browser",
+            "id_token": null,
+        })
+        .to_string();
+        let server = tokio::spawn(async move {
+            let (mut device, _) = listener.accept().await.expect("accept device request");
+            let mut request = vec![0_u8; 8192];
+            let count = device
+                .read(&mut request)
+                .await
+                .expect("read device request");
+            assert!(
+                String::from_utf8_lossy(request.get(..count).unwrap_or_default())
+                    .starts_with("POST /device-code ")
+            );
+            device
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nCf-Mitigated: challenge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write device denial");
+
+            let (mut token, _) = listener.accept().await.expect("accept token exchange");
+            let count = token.read(&mut request).await.expect("read token exchange");
+            let request = String::from_utf8_lossy(request.get(..count).unwrap_or_default());
+            assert!(request.starts_with("POST /token "), "{request}");
+            assert!(
+                request.contains("grant_type=authorization_code"),
+                "{request}"
+            );
+            assert!(request.contains("code=browser-code"), "{request}");
+            assert!(request.contains("code_verifier="), "{request}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{token_body}",
+                token_body.len()
+            );
+            token
+                .write_all(response.as_bytes())
+                .await
+                .expect("write token response");
+        });
+
+        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let auth = PlatformAuthenticator::new(
+            None,
+            Some(reqwest::Client::new()),
+            DeviceCodeHandler::new(move |prompt| {
+                let _ = prompt_tx.send(prompt);
+            }),
+            true,
+        );
+        let device_url = format!("http://{address}/device-code");
+        let token_url = format!("http://{address}/token");
+        let issuer = format!("http://{address}");
+        let login = tokio::spawn(async move {
+            auth.login_with_fallback_at(
+                &device_url,
+                &device_url,
+                &token_url,
+                &issuer,
+                &token_url,
+                &[0],
+            )
+            .await
+        });
+
+        let prompt = prompt_rx.recv().await.expect("browser prompt");
+        assert!(prompt.user_code.is_empty());
+        let authorize_url = url::Url::parse(&prompt.verification_uri).expect("authorize URL");
+        let params: std::collections::HashMap<_, _> =
+            authorize_url.query_pairs().into_owned().collect();
+        let redirect_uri = params.get("redirect_uri").expect("redirect URI");
+        let state = params.get("state").expect("OAuth state");
+        let redirect = url::Url::parse(redirect_uri).expect("redirect URL");
+        let callback_address = format!(
+            "{}:{}",
+            redirect.host_str().expect("redirect host"),
+            redirect.port().expect("redirect port")
+        );
+        let mut callback = tokio::net::TcpStream::connect(callback_address)
+            .await
+            .expect("connect browser callback");
+        callback
+            .write_all(
+                format!(
+                    "GET /auth/callback?state={state}&code=browser-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send browser callback");
+        let mut callback_response = String::new();
+        callback
+            .read_to_string(&mut callback_response)
+            .await
+            .expect("read browser callback response");
+        assert!(callback_response.starts_with("HTTP/1.1 200"));
+
+        let record = login
+            .await
+            .expect("login task")
+            .expect("browser fallback login");
+        server.await.expect("OAuth fixture exits");
+        assert_eq!(record.access_token.as_deref(), Some(access_token.as_str()));
+        assert_eq!(
+            record.refresh_token.as_deref(),
+            Some("refresh-from-browser")
+        );
+        assert_eq!(record.expires_at, Some(i64::MAX - 2));
+        assert!(!record.reauth_required);
     }
 
     #[test]
