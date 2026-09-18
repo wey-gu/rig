@@ -806,7 +806,7 @@ fn format_browser_token_error(
     error: Option<&OAuthErrorResponse>,
 ) -> String {
     let code = error
-        .and_then(|error| error.error.as_deref())
+        .and_then(OAuthErrorResponse::code)
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let description = error
@@ -1346,7 +1346,7 @@ mod tests {
             "ChatGPT browser token exchange failed: 502 Bad Gateway"
         );
         let parsed = OAuthErrorResponse {
-            error: Some("access_denied".into()),
+            error: Some(super::OAuthError::Code("access_denied".into())),
             error_description: Some("workspace access is unavailable".into()),
         };
         assert_eq!(
