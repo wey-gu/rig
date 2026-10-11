@@ -480,7 +480,7 @@ where
             .into_iter()
             .map(|value| {
                 Ok((
-                    match value.get("distance") {
+                    match value.get("_distance") {
                         Some(Value::Number(distance)) => distance.as_f64().unwrap_or_default(),
                         _ => 0.0,
                     },
@@ -493,3 +493,6 @@ where
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;
