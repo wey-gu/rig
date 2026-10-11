@@ -13,6 +13,7 @@ still required by Nowledge Mem after upgrading from its v0.38.2 fork.
 | Responses gateway capabilities | Consume existing caller controls for instruction placement and omitted temperature/output limits, using the upstream instruction placement policy |
 | Delta-less Responses output | Recover unseen text/refusal parts from done/completed frames without duplicating streamed parts |
 | Mem Bazel source contract tests | Export the OAuth sources through a small Bazel package |
+| Mem search dependency alignment | Pin the optional LanceDB adapter to 0.33.0 / Lance 9, matching the App search projection; retain Arrow 58 |
 
 Upstream now covers noninteractive authentication, Anthropic string tool-input
 coercion, reasoning aliases, id-less assistant input, completed tool identity
