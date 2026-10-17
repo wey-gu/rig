@@ -12,6 +12,8 @@ mod wasm;
 
 #[cfg(not(target_family = "wasm"))]
 use native as platform;
+#[cfg(not(target_family = "wasm"))]
+pub use native::clear_oauth_cache;
 #[cfg(target_family = "wasm")]
 use wasm as platform;
 

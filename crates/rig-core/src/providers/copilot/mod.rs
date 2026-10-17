@@ -21,6 +21,8 @@
 //! ```
 
 mod auth;
+#[cfg(not(target_family = "wasm"))]
+pub use auth::clear_oauth_cache;
 
 use crate::client::{
     self, ApiKey, DebugExt, ModelLister, Provider, ProviderBuilder, ProviderClient, Transport,
