@@ -1984,6 +1984,9 @@ impl TextConfig {
 #[serde(rename_all = "snake_case")]
 pub enum TextFormat {
     JsonSchema(StructuredOutputsInput),
+    /// JSON mode without a schema (`{"type": "json_object"}`): the Responses
+    /// API's spelling of Chat Completions' `response_format: json_object`.
+    JsonObject,
     #[default]
     Text,
 }
@@ -4875,6 +4878,23 @@ mod tests {
 
         CompletionRequest::try_from(("gpt-5.6".to_string(), request))
             .expect("request with reasoning params should convert")
+    }
+
+    #[test]
+    fn json_object_text_format_survives_request_conversion() {
+        let mut request = request_with_preamble("You are concise.");
+        request.additional_params = Some(json!({
+            "text": { "format": { "type": "json_object" } }
+        }));
+        let request = CompletionRequest::try_from(("gpt-5.6".to_string(), request))
+            .expect("json_object text format should convert");
+        let serialized = serde_json::to_value(&request).expect("request should serialize");
+
+        assert_eq!(
+            serialized["text"],
+            json!({ "format": { "type": "json_object" } })
+        );
+        assert!(serialized.get("response_format").is_none());
     }
 
     #[test]
