@@ -11,6 +11,7 @@ still required by Nowledge Mem after upgrading from its v0.38.2 fork.
 | Gemini through OpenAI-compatible relays | Preserve each call's provider extensions and thought signature across normalization, streaming, and history replay |
 | Strict tool object schemas | Normalize snake-case additional properties and close every object schema |
 | Responses gateway capabilities | Consume existing caller controls for instruction placement and omitted temperature/output limits, using the upstream instruction placement policy |
+| Responses JSON mode without a schema | Accept `text.format {type: json_object}` in requests and echoed responses (nowledge-co/mem#8158) |
 | Delta-less Responses output | Recover unseen text/refusal parts from done/completed frames without duplicating streamed parts |
 | Mem Bazel source contract tests | Export the OAuth sources through a small Bazel package |
 | Mem search dependency alignment | Pin the optional LanceDB adapter to 0.33.0 / Lance 9, matching the App search projection; retain Arrow 58 |
