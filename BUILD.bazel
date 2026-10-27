@@ -1,5 +1,9 @@
 exports_files(
     [
+        "crates/rig-core/src/providers/copilot/auth/mod.rs",
+        "crates/rig-core/src/providers/copilot/auth/native.rs",
+        "crates/rig-core/src/providers/internal/auth.rs",
+        "crates/rig-core/src/providers/internal/device_auth.rs",
         "crates/rig-core/src/providers/chatgpt/auth/native.rs",
         "crates/rig-core/src/providers/chatgpt/mod.rs",
     ],

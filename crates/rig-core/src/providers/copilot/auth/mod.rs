@@ -95,3 +95,6 @@ impl Authenticator {
         }
     }
 }
+
+#[cfg(not(target_family = "wasm"))]
+pub use native::{cached_auth_context, clear_auth_cache, reauthentication_required};
