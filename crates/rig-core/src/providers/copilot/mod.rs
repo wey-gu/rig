@@ -22,6 +22,9 @@
 
 mod auth;
 
+#[cfg(not(target_family = "wasm"))]
+pub use auth::{cached_auth_context, clear_auth_cache, reauthentication_required};
+
 use crate::client::{
     self, ApiKey, DebugExt, ModelLister, Provider, ProviderBuilder, ProviderClient, Transport,
 };
