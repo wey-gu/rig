@@ -13,6 +13,7 @@ still required by Nowledge Mem after upgrading from its v0.38.2 fork.
 | Responses gateway capabilities | Consume existing caller controls for instruction placement and omitted temperature/output limits, using the upstream instruction placement policy |
 | Responses JSON mode without a schema | Accept `text.format {type: json_object}` in requests and echoed responses (nowledge-co/mem#8158) |
 | Delta-less Responses output | Recover unseen text/refusal parts from done/completed frames without duplicating streamed parts |
+| Copilot Responses-only models | Route completions by the model's declared `supported_endpoints` (cached `GET /models`), retry once on the other endpoint after `unsupported_api_for_model`, share the catalog across clients (nowledge-co/mem#9880) |
 | Mem Bazel source contract tests | Export the OAuth sources through a small Bazel package |
 | Mem search dependency alignment | Pin the optional LanceDB adapter to 0.33.0 / Lance 9, matching the App search projection; retain Arrow 58 |
 
