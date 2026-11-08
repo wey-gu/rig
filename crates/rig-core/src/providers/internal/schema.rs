@@ -16,6 +16,12 @@ pub(crate) struct SanitizeOptions {
     /// types (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
     /// `multipleOf`).
     pub(crate) strip_numeric_constraints: bool,
+    /// Strict function tools: a property the schema did not require becomes
+    /// nullable when it is forced into `required`, so a model can send `null`
+    /// for "not set" instead of inventing a value (OpenAI's documented way to
+    /// express optional fields in strict mode). Originally required
+    /// properties stay non-nullable.
+    pub(crate) nullable_optional: bool,
 }
 
 /// Recursively rewrites `schema` in place to respect a provider's structured
@@ -48,7 +54,20 @@ pub(crate) fn sanitize_schema(schema: &mut serde_json::Value, options: SanitizeO
             obj.insert("additionalProperties".to_string(), Value::Bool(false));
         }
 
+        let mut optional_properties = Vec::new();
         if let Some(Value::Object(properties)) = obj.get("properties") {
+            let originally_required: std::collections::HashSet<&str> = obj
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|keys| keys.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if options.nullable_optional {
+                optional_properties = properties
+                    .keys()
+                    .filter(|key| !originally_required.contains(key.as_str()))
+                    .cloned()
+                    .collect();
+            }
             let prop_keys = properties.keys().cloned().map(Value::String).collect();
             obj.insert("required".to_string(), Value::Array(prop_keys));
         }
@@ -81,8 +100,11 @@ pub(crate) fn sanitize_schema(schema: &mut serde_json::Value, options: SanitizeO
         if let Some(properties) = obj.get_mut("properties")
             && let Value::Object(props) = properties
         {
-            for (_, prop_value) in props.iter_mut() {
+            for (key, prop_value) in props.iter_mut() {
                 sanitize_schema(prop_value, options);
+                if optional_properties.contains(key) {
+                    make_nullable(prop_value);
+                }
             }
         }
 
@@ -128,6 +150,58 @@ pub(crate) fn sanitize_schema(schema: &mut serde_json::Value, options: SanitizeO
     }
 }
 
+/// Let `schema` also accept JSON `null`: add `"null"` to its `type` (and to
+/// its `enum`, which would otherwise still reject it), or, for a schema
+/// without a plain `type` (`$ref`, combinators, `const`), offer a
+/// `{"type": "null"}` alternative. Idempotent.
+fn make_nullable(schema: &mut serde_json::Value) {
+    use serde_json::Value;
+
+    let null_branch = || serde_json::json!({"type": "null"});
+    let Value::Object(obj) = schema else {
+        return;
+    };
+    let plain_type = match obj.get("type") {
+        Some(Value::String(_) | Value::Array(_)) => !obj.contains_key("$ref"),
+        _ => false,
+    };
+    if plain_type && !obj.contains_key("anyOf") && !obj.contains_key("const") {
+        match obj.get_mut("type") {
+            Some(Value::String(kind)) if kind == "null" => {}
+            Some(Value::String(kind)) => {
+                let kind = std::mem::take(kind);
+                obj.insert(
+                    "type".to_string(),
+                    Value::Array(vec![Value::String(kind), Value::String("null".into())]),
+                );
+            }
+            Some(Value::Array(kinds)) => {
+                if !kinds.iter().any(|kind| kind == "null") {
+                    kinds.push(Value::String("null".into()));
+                }
+            }
+            _ => {}
+        }
+        if let Some(Value::Array(values)) = obj.get_mut("enum")
+            && !values.contains(&Value::Null)
+        {
+            values.push(Value::Null);
+        }
+        return;
+    }
+    if let Some(Value::Array(branches)) = obj.get_mut("anyOf") {
+        if !branches
+            .iter()
+            .any(|branch| branch.get("type") == Some(&Value::String("null".into())))
+        {
+            branches.push(null_branch());
+        }
+        return;
+    }
+    let inner = std::mem::take(schema);
+    *schema = serde_json::json!({"anyOf": [inner, null_branch()]});
+}
+
 /// Whether a `type` keyword admits objects (`"object"` or a type list that
 /// contains it, e.g. `["object", "null"]`).
 fn declares_object_type(kind: Option<&serde_json::Value>) -> bool {
@@ -170,6 +244,11 @@ mod tests {
         strip_ref_siblings: true,
         inject_empty_properties: true,
         strip_numeric_constraints: false,
+        nullable_optional: false,
+    };
+    const STRICT_TOOL: SanitizeOptions = SanitizeOptions {
+        nullable_optional: true,
+        ..OPENAI
     };
 
     /// Every object-like node is closed and requires all of its properties,
@@ -231,6 +310,85 @@ mod tests {
         assert_strict(&schema, "");
     }
 
+    /// Strict tools: once every property is required, the ones the schema
+    /// did not require must accept `null`, so the model can say "not set"
+    /// (it otherwise invents `""` for `thread_reference`). Required ones stay
+    /// non-nullable; nested objects follow their own `required`.
+    #[test]
+    fn strict_tools_make_originally_optional_properties_nullable() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "thread_id": {"type": "string"},
+                "thread_reference": {"type": "string", "description": "URI"},
+                "limit": {"type": "integer"},
+                "mode": {"type": "string", "enum": ["exact", "fuzzy"]},
+                "kinds": {"type": ["string", "array"]},
+                "already": {"type": ["string", "null"]},
+                "pick": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                "shape": {"$ref": "#/$defs/Shape"},
+                "fixed": {"const": "v1"},
+                "filter": {
+                    "type": "object",
+                    "properties": {"must": {"type": "string"}, "may": {"type": "boolean"}},
+                    "required": ["must"]
+                }
+            },
+            "required": ["thread_id"],
+            "$defs": {"Shape": {"type": "object", "properties": {"x": {"type": "integer"}}}}
+        });
+        sanitize_schema(&mut schema, STRICT_TOOL);
+        let props = &schema["properties"];
+
+        assert_eq!(props["thread_id"]["type"], json!("string"));
+        assert_eq!(props["thread_reference"]["type"], json!(["string", "null"]));
+        assert_eq!(props["thread_reference"]["description"], json!("URI"));
+        assert_eq!(props["limit"]["type"], json!(["integer", "null"]));
+        assert_eq!(props["mode"]["type"], json!(["string", "null"]));
+        assert_eq!(props["mode"]["enum"], json!(["exact", "fuzzy", null]));
+        assert_eq!(props["kinds"]["type"], json!(["string", "array", "null"]));
+        assert_eq!(props["already"]["type"], json!(["string", "null"]));
+        assert_eq!(
+            props["pick"]["anyOf"],
+            json!([{"type": "string"}, {"type": "integer"}, {"type": "null"}])
+        );
+        assert_eq!(
+            props["shape"],
+            json!({"anyOf": [{"$ref": "#/$defs/Shape"}, {"type": "null"}]})
+        );
+        assert_eq!(
+            props["fixed"],
+            json!({"anyOf": [{"const": "v1"}, {"type": "null"}]})
+        );
+        // The nested object is itself optional, and keeps its own contract.
+        assert_eq!(props["filter"]["type"], json!(["object", "null"]));
+        assert_eq!(
+            props["filter"]["properties"]["must"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            props["filter"]["properties"]["may"]["type"],
+            json!(["boolean", "null"])
+        );
+        assert_strict(&schema, "");
+
+        // Idempotent: a second pass changes nothing.
+        let once = schema.clone();
+        sanitize_schema(&mut schema, STRICT_TOOL);
+        assert_eq!(schema, once);
+    }
+
+    #[test]
+    fn structured_output_keeps_optional_properties_non_nullable() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+            "required": ["a"]
+        });
+        sanitize_schema(&mut schema, OPENAI);
+        assert_eq!(schema["properties"]["b"]["type"], json!("integer"));
+    }
+
     #[test]
     fn typed_branches_survive_and_are_closed_at_every_depth() {
         let mut schema = json!({
@@ -287,6 +445,7 @@ mod tests {
                     strip_ref_siblings: true,
                     inject_empty_properties: true,
                     strip_numeric_constraints: false,
+                    nullable_optional: false,
                 },
             );
             assert_eq!(schema["additionalProperties"], false);

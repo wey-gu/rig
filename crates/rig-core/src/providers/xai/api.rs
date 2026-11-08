@@ -31,7 +31,7 @@ struct CompletionRequest {
 fn normalize_strict_tool(mut tool: Value) -> Value {
     if tool.get("type").and_then(Value::as_str) == Some("function") {
         if let Some(parameters) = tool.get_mut("parameters") {
-            crate::providers::openai::sanitize_schema(parameters);
+            crate::providers::openai::sanitize_strict_tool_schema(parameters);
         }
         if let Some(tool) = tool.as_object_mut() {
             tool.insert("strict".to_string(), Value::Bool(true));

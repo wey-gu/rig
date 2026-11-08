@@ -1891,6 +1891,7 @@ fn sanitize_schema(schema: &mut serde_json::Value) {
     crate::providers::internal::schema::sanitize_schema(
         schema,
         crate::providers::internal::schema::SanitizeOptions {
+            nullable_optional: false,
             strip_ref_siblings: false,
             inject_empty_properties: false,
             strip_numeric_constraints: true,

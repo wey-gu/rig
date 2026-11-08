@@ -47,6 +47,24 @@ pub(crate) fn sanitize_schema(schema: &mut serde_json::Value) {
             strip_ref_siblings: true,
             inject_empty_properties: true,
             strip_numeric_constraints: false,
+            nullable_optional: false,
+        },
+    );
+}
+
+/// [`sanitize_schema`] for a strict FUNCTION TOOL: additionally makes every
+/// property the schema did not require nullable once strict mode forces it
+/// into `required`, so a model can send `null` instead of inventing a value.
+/// Structured-output schemas keep [`sanitize_schema`]: their shape is the
+/// caller's Rust type, where `null` may not deserialize.
+pub(crate) fn sanitize_strict_tool_schema(schema: &mut serde_json::Value) {
+    crate::providers::internal::schema::sanitize_schema(
+        schema,
+        crate::providers::internal::schema::SanitizeOptions {
+            strip_ref_siblings: true,
+            inject_empty_properties: true,
+            strip_numeric_constraints: false,
+            nullable_optional: true,
         },
     );
 }

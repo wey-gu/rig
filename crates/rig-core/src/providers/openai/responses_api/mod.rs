@@ -795,7 +795,7 @@ impl ResponsesToolDefinition {
     /// returned unchanged because strict mode only applies to function tools.
     pub fn with_strict(mut self) -> Self {
         if self.kind == "function" {
-            super::sanitize_schema(&mut self.parameters);
+            super::sanitize_strict_tool_schema(&mut self.parameters);
             self.strict = true;
         }
         self

@@ -509,7 +509,7 @@ impl ToolDefinition {
     /// This sets `strict: true` and sanitizes the schema to meet OpenAI requirements.
     pub fn with_strict(mut self) -> Self {
         self.function.strict = Some(true);
-        super::sanitize_schema(&mut self.function.parameters);
+        super::sanitize_strict_tool_schema(&mut self.function.parameters);
         self
     }
 }
