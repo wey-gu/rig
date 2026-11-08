@@ -671,6 +671,39 @@ async fn a_learned_route_outlives_the_client_that_learned_it() {
 }
 
 #[tokio::test]
+async fn completion_endpoint_reports_the_route_a_request_would_take() {
+    let http = PathScriptedHttpClient::new(vec![(
+        "/models",
+        Reply::Json(http::StatusCode::OK, CATALOG),
+    )]);
+    let client = client(&http);
+
+    assert_eq!(
+        client
+            .completion_model("gpt-6-luna")
+            .completion_endpoint()
+            .await,
+        "/responses"
+    );
+    assert_eq!(
+        client
+            .completion_model("chat-only")
+            .completion_endpoint()
+            .await,
+        "/chat/completions"
+    );
+    // Not in the catalog: the name rule.
+    assert_eq!(
+        client
+            .completion_model("unlisted-codex")
+            .completion_endpoint()
+            .await,
+        "/responses"
+    );
+    assert!(http.completion_paths().is_empty(), "no completion is sent");
+}
+
+#[tokio::test]
 async fn an_expired_catalog_is_fetched_again() {
     let catalog =
         super::CopilotRouteCatalog::with_ttl(std::time::Duration::ZERO, std::time::Duration::ZERO);

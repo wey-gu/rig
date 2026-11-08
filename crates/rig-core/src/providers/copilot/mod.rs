@@ -784,6 +784,16 @@ where
         }
     }
 
+    /// The completion endpoint a request for this model would use right now:
+    /// `"/chat/completions"` or `"/responses"`, resolved exactly like a real
+    /// request (learned route, declared catalog, then the model-name rule).
+    ///
+    /// For callers that hand the credential to another client and must tell
+    /// it which wire to speak. May fetch the model catalog.
+    pub async fn completion_endpoint(&self) -> &'static str {
+        self.plan_route().await.route.path()
+    }
+
     fn note_route_rejection(&self, rejected: CompletionRoute, retry: CompletionRoute) {
         tracing::warn!(
             target: "rig::completions",
