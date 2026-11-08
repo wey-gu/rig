@@ -1,4 +1,21 @@
 when:
+  path: /models
+  method: GET
+  query_param: []
+  header:
+  - name: accept
+    value: '*/*'
+  - name: content-type
+    value: application/json
+  body: null
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: application/json
+  body: '{"data":[{"capabilities":{"type":"chat"},"id":"gpt-5.3-codex","name":"GPT-5.3-Codex","object":"model","supported_endpoints":["/responses","ws:/responses"],"vendor":"OpenAI"}],"object":"list"}'
+---
+when:
   path: /responses
   method: POST
   query_param: []

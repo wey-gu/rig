@@ -3,9 +3,10 @@
 //! Supports Chat Completions, Responses, and Embeddings against
 //! `https://api.githubcopilot.com`.
 //!
-//! `Client::completion_model(...)` automatically routes Codex-class models
-//! through `/responses` and conversational models through
-//! `/chat/completions`.
+//! `Client::completion_model(...)` routes each model to the completion
+//! endpoint Copilot declares for it (`supported_endpoints` on `GET /models`),
+//! and recovers once from an `unsupported_api_for_model` rejection by retrying
+//! on the other endpoint. See [`CopilotRouteCatalog`] for the resolution order.
 //!
 //! # Example
 //! ```no_run
@@ -21,6 +22,15 @@
 //! ```
 
 mod auth;
+mod routing;
+#[cfg(test)]
+mod routing_tests;
+
+use routing::{CATALOG_FETCH_TIMEOUT, CompletionRoute, declared_route, route_for_model};
+pub use routing::{
+    CopilotRouteCatalog, DEFAULT_CATALOG_FAILURE_BACKOFF, DEFAULT_CATALOG_TTL,
+    is_unsupported_api_for_model,
+};
 
 use crate::client::{
     self, ApiKey, DebugExt, ModelLister, Provider, ProviderBuilder, ProviderClient, Transport,
@@ -42,6 +52,7 @@ use http::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use tracing_futures::Instrument as _;
@@ -152,17 +163,20 @@ pub struct CopilotBuilder {
     api_key_file: Option<PathBuf>,
     device_code_handler: auth::DeviceCodeHandler,
     allow_device_flow: bool,
+    route_catalog: Option<CopilotRouteCatalog>,
 }
 
 #[derive(Clone)]
 pub struct CopilotExt {
     auth: auth::Authenticator,
+    routes: CopilotRouteCatalog,
 }
 
 impl Debug for CopilotExt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CopilotExt")
             .field("auth", &self.auth)
+            .field("routes", &self.routes)
             .finish()
     }
 }
@@ -179,6 +193,7 @@ impl Default for CopilotBuilder {
             api_key_file: token_dir.map(|dir| dir.join("api-key.json")),
             device_code_handler: auth::DeviceCodeHandler::default(),
             allow_device_flow: true,
+            route_catalog: None,
         }
     }
 }
@@ -230,6 +245,7 @@ impl ProviderBuilder for CopilotBuilder {
                 ext.device_code_handler.clone(),
                 ext.allow_device_flow,
             ),
+            routes: ext.route_catalog.clone().unwrap_or_default(),
         })
     }
 }
@@ -298,6 +314,19 @@ impl<H> ClientBuilder<H> {
     pub fn allow_device_flow(self, allow: bool) -> Self {
         self.over_ext(|mut ext| {
             ext.allow_device_flow = allow;
+            ext
+        })
+    }
+
+    /// Share a [`CopilotRouteCatalog`] with other clients.
+    ///
+    /// By default each client owns its catalog, so the model list is fetched
+    /// once per client per TTL and a learned route lives as long as the
+    /// client. Callers that build a fresh client per request should pass one
+    /// long-lived catalog here, so routing knowledge outlives each client.
+    pub fn route_catalog(self, catalog: CopilotRouteCatalog) -> Self {
+        self.over_ext(|mut ext| {
+            ext.route_catalog = Some(catalog);
             ext
         })
     }
@@ -565,18 +594,13 @@ impl RequestFacts {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompletionRoute {
-    ChatCompletions,
-    Responses,
-}
-
-fn route_for_model(model: &str) -> CompletionRoute {
-    if model.to_ascii_lowercase().contains("codex") {
-        CompletionRoute::Responses
-    } else {
-        CompletionRoute::ChatCompletions
-    }
+/// The route a request takes, plus the key its outcome is remembered under.
+struct RoutePlan {
+    /// Runtime base URL. `None` when authentication failed while planning:
+    /// the request still runs (and reports the auth error from its own
+    /// signing step), but nothing is learned from it.
+    base: Option<String>,
+    route: CompletionRoute,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -715,8 +739,80 @@ where
         self.with_intent(CopilotIntent::Edits)
     }
 
-    fn route(&self) -> CompletionRoute {
-        route_for_model(&self.model)
+    /// Resolve the route for this model: a learned route first, then the
+    /// declared catalog, then the model-name rule.
+    ///
+    /// Authentication failure here is not reported: the route falls back to
+    /// the name rule and the request's own signing step reports the error
+    /// after request conversion, preserving the routes' error precedence.
+    async fn plan_route(&self) -> RoutePlan {
+        let fallback = route_for_model(&self.model);
+        let Ok(auth) = self.auth_context().await else {
+            return RoutePlan {
+                base: None,
+                route: fallback,
+            };
+        };
+        let base = runtime_base_url(&self.client, &auth).into_owned();
+        let catalog = &self.client.ext().routes;
+
+        if let Some(route) = catalog.learned_route(&base, &self.model) {
+            return RoutePlan {
+                base: Some(base),
+                route,
+            };
+        }
+
+        let declared = catalog
+            .declared_endpoints(&base, &self.model, || async {
+                crate::wasm_compat::timeout(
+                    CATALOG_FETCH_TIMEOUT,
+                    fetch_declared_endpoints(&self.client, &auth),
+                )
+                .await
+                .unwrap_or_else(|_| Err("model catalog fetch timed out".to_string()))
+            })
+            .await;
+        let route = declared
+            .as_deref()
+            .and_then(|endpoints| declared_route(&self.model, endpoints))
+            .unwrap_or(fallback);
+
+        RoutePlan {
+            base: Some(base),
+            route,
+        }
+    }
+
+    fn note_route_rejection(&self, rejected: CompletionRoute, retry: CompletionRoute) {
+        tracing::warn!(
+            target: "rig::completions",
+            model = %self.model,
+            rejected = %rejected,
+            retry = %retry,
+            "Copilot does not serve this model on the endpoint; retrying once on the other endpoint"
+        );
+    }
+
+    /// Remember the outcome of a fallback attempt. The planned route was
+    /// refused, so the alternate is the only candidate: keep it unless it was
+    /// refused too, in which case neither endpoint serves the model and
+    /// nothing is kept.
+    fn settle_retry(
+        &self,
+        plan: &RoutePlan,
+        retry: CompletionRoute,
+        error: Option<&CompletionError>,
+    ) {
+        let Some(base) = plan.base.as_deref() else {
+            return;
+        };
+        let catalog = &self.client.ext().routes;
+        if error.is_some_and(is_unsupported_api_for_model) {
+            catalog.forget_route(base, &self.model);
+        } else {
+            catalog.learn_route(base, &self.model, retry);
+        }
     }
 
     async fn auth_context(&self) -> Result<auth::AuthContext, CompletionError> {
@@ -1004,7 +1100,26 @@ where
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<(CopilotCompletionResponse, Option<String>), CompletionError> {
-        match self.route() {
+        let plan = self.plan_route().await;
+        let retry_request = completion_request.clone();
+        match self.raw_completion_on(plan.route, completion_request).await {
+            Err(error) if is_unsupported_api_for_model(&error) => {
+                let retry = plan.route.alternate();
+                self.note_route_rejection(plan.route, retry);
+                let result = self.raw_completion_on(retry, retry_request).await;
+                self.settle_retry(&plan, retry, result.as_ref().err());
+                result
+            }
+            result => result,
+        }
+    }
+
+    async fn raw_completion_on(
+        &self,
+        route: CompletionRoute,
+        completion_request: completion::CompletionRequest,
+    ) -> Result<(CopilotCompletionResponse, Option<String>), CompletionError> {
+        match route {
             CompletionRoute::ChatCompletions => self
                 .raw_completion_chat(completion_request)
                 .await
@@ -1021,12 +1136,73 @@ where
 
     /// Open a stream on whichever route this model is configured for, keeping
     /// the terminal record provider-native.
+    ///
+    /// Copilot reports an endpoint rejection as the stream's first item, so a
+    /// rejected stream is reopened once on the other endpoint before anything
+    /// reaches the caller; the caller only ever sees the stream that answered.
     pub async fn raw_stream(
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<crate::streaming::RawStreamingResult<CopilotStreamingResponse>, CompletionError>
     {
-        match self.route() {
+        let plan = self.plan_route().await;
+        let retry_request = completion_request.clone();
+        let primary = match self.raw_stream_on(plan.route, completion_request).await {
+            Ok(stream) => stream,
+            Err(error) if is_unsupported_api_for_model(&error) => {
+                Box::pin(futures::stream::once(async move { Err(error) }))
+            }
+            Err(error) => return Err(error),
+        };
+
+        let model = self.clone();
+        let stream = async_stream::stream! {
+            let mut primary = primary;
+            match primary.next().await {
+                Some(Err(error)) if is_unsupported_api_for_model(&error) => {
+                    let retry = plan.route.alternate();
+                    model.note_route_rejection(plan.route, retry);
+                    match model.raw_stream_on(retry, retry_request).await {
+                        Ok(mut stream) => {
+                            let first = stream.next().await;
+                            let first_error = match &first {
+                                Some(Err(error)) => Some(error),
+                                _ => None,
+                            };
+                            model.settle_retry(&plan, retry, first_error);
+                            if let Some(item) = first {
+                                yield item;
+                            }
+                            while let Some(item) = stream.next().await {
+                                yield item;
+                            }
+                        }
+                        Err(error) => {
+                            model.settle_retry(&plan, retry, Some(&error));
+                            yield Err(error);
+                        }
+                    }
+                }
+                Some(item) => {
+                    yield item;
+                    while let Some(item) = primary.next().await {
+                        yield item;
+                    }
+                }
+                None => {}
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn raw_stream_on(
+        &self,
+        route: CompletionRoute,
+        completion_request: completion::CompletionRequest,
+    ) -> Result<crate::streaming::RawStreamingResult<CopilotStreamingResponse>, CompletionError>
+    {
+        match route {
             CompletionRoute::ChatCompletions => self.raw_stream_chat(completion_request).await,
             CompletionRoute::Responses => self.raw_stream_responses(completion_request).await,
         }
@@ -1284,6 +1460,64 @@ struct ListModelEntry {
     vendor: Option<String>,
     #[serde(default)]
     capabilities: Option<ListModelEntryCapabilities>,
+    /// Endpoints Copilot serves this model on, e.g. `["/responses"]`. Absent
+    /// for older entries; routing then falls back to the model-name rule.
+    #[serde(default)]
+    supported_endpoints: Option<Vec<String>>,
+}
+
+/// `GET /models`, shared by the model lister and the route catalog.
+async fn fetch_model_entries<H>(
+    client: &Client<H>,
+    auth: &auth::AuthContext,
+) -> Result<Vec<ListModelEntry>, ModelListingError>
+where
+    Client<H>: HttpClientExt,
+{
+    let headers = default_headers(&auth.api_key, "user", false, CopilotIntent::Panel);
+    let req = apply_headers(
+        get_with_auth_base(client, auth, MODEL_LISTING_PATH, Transport::Http)?,
+        &headers,
+    )
+    .body(http_client::NoBody)?;
+
+    let response = client.send::<_, Vec<u8>>(req).await.map_err(|error| {
+        crate::providers::internal::model_listing::map_transport_error(
+            MODEL_LISTING_PROVIDER,
+            MODEL_LISTING_PATH,
+            error,
+        )
+    })?;
+
+    let api_resp: ListModelsResponse =
+        crate::providers::internal::model_listing::decode_json_response(
+            response,
+            MODEL_LISTING_PROVIDER,
+            MODEL_LISTING_PATH,
+        )
+        .await?;
+    Ok(api_resp.data)
+}
+
+/// Declared completion endpoints by model id, for the route catalog.
+async fn fetch_declared_endpoints<H>(
+    client: &Client<H>,
+    auth: &auth::AuthContext,
+) -> Result<HashMap<String, Vec<String>>, String>
+where
+    Client<H>: HttpClientExt,
+{
+    let entries = fetch_model_entries(client, auth)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .supported_endpoints
+                .map(|endpoints| (entry.id, endpoints))
+        })
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1327,29 +1561,8 @@ where
             }
         })?;
 
-        let headers = default_headers(&auth.api_key, "user", false, CopilotIntent::Panel);
-        let req = apply_headers(
-            get_with_auth_base(&self.client, &auth, MODEL_LISTING_PATH, Transport::Http)?,
-            &headers,
-        )
-        .body(http_client::NoBody)?;
-
-        let response = self.client.send::<_, Vec<u8>>(req).await.map_err(|error| {
-            crate::providers::internal::model_listing::map_transport_error(
-                MODEL_LISTING_PROVIDER,
-                MODEL_LISTING_PATH,
-                error,
-            )
-        })?;
-
-        let api_resp: ListModelsResponse =
-            crate::providers::internal::model_listing::decode_json_response(
-                response,
-                MODEL_LISTING_PROVIDER,
-                MODEL_LISTING_PATH,
-            )
-            .await?;
-        let models = api_resp.data.into_iter().map(Model::from).collect();
+        let entries = fetch_model_entries(&self.client, &auth).await?;
+        let models = entries.into_iter().map(Model::from).collect();
 
         Ok(ModelList::new(models))
     }
@@ -1404,6 +1617,20 @@ mod tests {
     use crate::test_utils::{RecordingHttpClient, SequencedStreamingHttpClient};
     use futures::StreamExt;
     use std::collections::HashMap;
+
+    /// Completion requests a [`RecordingHttpClient`] saw, without the route
+    /// catalog's `GET /models` (the recording double answers it with the
+    /// completion body, which is not a model list, so routing falls back to
+    /// the name rule these tests pin).
+    fn completion_requests(
+        http_client: &RecordingHttpClient,
+    ) -> Vec<crate::test_utils::CapturedHttpRequest> {
+        http_client
+            .requests()
+            .into_iter()
+            .filter(|request| !request.uri.ends_with("/models"))
+            .collect()
+    }
 
     fn env_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
@@ -1671,7 +1898,7 @@ mod tests {
 
         let _response = model.completion(request).await.expect("chat completion");
 
-        let requests = http_client.requests();
+        let requests = completion_requests(&http_client);
         assert_eq!(requests.len(), 1);
         assert!(
             requests[0]
@@ -1696,7 +1923,7 @@ mod tests {
 
         let _response = model.completion(request).await.expect("chat completion");
 
-        let requests = http_client.requests();
+        let requests = completion_requests(&http_client);
         assert_eq!(requests.len(), 1);
         assert!(
             requests[0].uri.starts_with("https://custom.example.com"),
@@ -1718,7 +1945,7 @@ mod tests {
 
         let _response = model.completion(request).await.expect("chat completion");
 
-        let requests = http_client.requests();
+        let requests = completion_requests(&http_client);
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0]
@@ -1742,7 +1969,7 @@ mod tests {
 
         let _response = model.completion(request).await.expect("chat completion");
 
-        let requests = http_client.requests();
+        let requests = completion_requests(&http_client);
         assert_eq!(requests.len(), 1);
         assert!(requests[0].uri.ends_with("/chat/completions"));
         assert!(String::from_utf8_lossy(&requests[0].body).contains("\"model\":\"gpt-4o\""));
@@ -1764,7 +1991,7 @@ mod tests {
             .await
             .expect("responses completion");
 
-        let requests = http_client.requests();
+        let requests = completion_requests(&http_client);
         assert_eq!(requests.len(), 1);
         assert!(requests[0].uri.ends_with("/responses"));
         assert!(String::from_utf8_lossy(&requests[0].body).contains("\"model\":\"gpt-5.3-codex\""));
