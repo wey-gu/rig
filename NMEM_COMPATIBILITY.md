@@ -12,6 +12,7 @@ still required by Nowledge Mem after upgrading from its v0.38.2 fork.
 | Strict tool object schemas | Normalize snake-case additional properties and close every object schema |
 | Responses gateway capabilities | Consume existing caller controls for instruction placement and omitted temperature/output limits, using the upstream instruction placement policy |
 | Responses JSON mode without a schema | Accept `text.format {type: json_object}` in requests and echoed responses (nowledge-co/mem#8158) |
+| ChatGPT subscription structured output | Keep a caller `text.format {type: json_schema}` on the Codex backend (the shape the Codex CLI sends); still drop every other text control (https://github.com/nowledge-co/mem/issues/10509) |
 | Delta-less Responses output | Recover unseen text/refusal parts from done/completed frames without duplicating streamed parts |
 | Copilot Responses-only models | Route completions by the model's declared `supported_endpoints` (cached `GET /models`), retry once on the other endpoint after `unsupported_api_for_model`, share the catalog across clients (nowledge-co/mem#9880) |
 | Mem Bazel source contract tests | Export the OAuth sources through a small Bazel package |
