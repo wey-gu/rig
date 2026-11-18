@@ -23,7 +23,7 @@ use crate::client::{self, ApiKey, DebugExt, Provider, ProviderBuilder, ProviderC
 use crate::completion::{self, CompletionError, NormalizeCompletionResponse};
 use crate::http_client::{self, HttpClientExt};
 use crate::providers::openai::responses_api::{
-    self, CompletionRequest as ResponsesRequest, Include,
+    self, CompletionRequest as ResponsesRequest, Include, TextFormat,
 };
 use crate::streaming::StreamingCompletionResponse;
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
@@ -417,7 +417,20 @@ where
         request.additional_parameters.parallel_tool_calls = None;
         request.additional_parameters.service_tier = None;
         request.additional_parameters.store = Some(false);
-        request.additional_parameters.text = None;
+        // The ChatGPT backend takes the Responses structured-output control
+        // the Codex CLI itself sends: `text.format` of type `json_schema`
+        // (`{type, name, schema, strict}`). Keep a caller-provided schema,
+        // whether it came from `output_schema` or from `additional_params`.
+        // Every other text control is dropped, as before: this backend's
+        // acceptance of `json_object` or a plain `text` format is unverified.
+        if !request
+            .additional_parameters
+            .text
+            .as_ref()
+            .is_some_and(|text| matches!(text.format, TextFormat::JsonSchema(_)))
+        {
+            request.additional_parameters.text = None;
+        }
         request.additional_parameters.top_p = None;
         request.additional_parameters.user = None;
 
@@ -1177,6 +1190,87 @@ data: [DONE]"#;
             .expect("request");
 
         assert!(request.temperature.is_none());
+    }
+
+    fn create_request_with_additional_params(
+        additional_params: Option<serde_json::Value>,
+        output_schema: Option<schemars::Schema>,
+    ) -> ResponsesRequest {
+        let client = crate::providers::chatgpt::Client::builder()
+            .oauth()
+            .build()
+            .expect("client");
+        ResponsesCompletionModel::new(client, GPT_5_3_CODEX)
+            .create_request(completion::CompletionRequest {
+                model: None,
+                preamble: None,
+                chat_history: vec![completion::Message::user("hello")],
+                documents: Vec::new(),
+                tools: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                tool_choice: None,
+                additional_params,
+                output_schema,
+                record_telemetry_content: false,
+            })
+            .expect("request")
+    }
+
+    /// A caller's strict `text.format` json_schema reaches the ChatGPT wire in
+    /// the shape the Codex CLI sends to the same backend.
+    #[test]
+    fn test_create_request_keeps_a_caller_json_schema_text_format() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"proposals": {"type": "array", "items": {"type": "string"}}},
+            "required": ["proposals"],
+            "additionalProperties": false,
+        });
+        let request = create_request_with_additional_params(
+            Some(serde_json::json!({
+                "text": {"format": {
+                    "type": "json_schema",
+                    "name": "fold_discovery",
+                    "schema": schema,
+                    "strict": true,
+                }}
+            })),
+            None,
+        );
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            body["text"],
+            serde_json::json!({"format": {
+                "type": "json_schema",
+                "name": "fold_discovery",
+                "schema": schema,
+                "strict": true,
+            }})
+        );
+    }
+
+    /// `output_schema` (the extractor path) also keeps its strict schema.
+    #[test]
+    fn test_create_request_keeps_an_output_schema() {
+        let schema = schemars::schema_for!(String);
+        let request = create_request_with_additional_params(None, Some(schema));
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["strict"], true);
+    }
+
+    /// Unverified text controls are still dropped.
+    #[test]
+    fn test_create_request_drops_other_text_formats() {
+        for format in ["json_object", "text"] {
+            let request = create_request_with_additional_params(
+                Some(serde_json::json!({"text": {"format": {"type": format}}})),
+                None,
+            );
+            let body = serde_json::to_value(&request).expect("serialize");
+            assert!(body.get("text").is_none(), "{format}: {body}");
+        }
     }
 
     #[tokio::test]
